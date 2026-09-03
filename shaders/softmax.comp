@@ -1,0 +1,56 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) buffer Data { float x[]; };
+layout(push_constant) uniform Params { uint dim; } p;
+
+shared float partial_max[256];
+shared float partial_sum[256];
+
+void main() {
+    uint lid = gl_LocalInvocationID.x;
+    uint gid = gl_GlobalInvocationID.x;
+    uint row = gid / p.dim;
+    uint col = gid % p.dim;
+    uint base = row * p.dim;
+
+    float val = (col < p.dim) ? x[base + col] : -1e30;
+    partial_max[lid] = val;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial_max[lid] = max(partial_max[lid], partial_max[lid + stride]);
+        }
+        barrier();
+    }
+
+    float mx;
+    if (lid == 0u) mx = partial_max[0];
+    barrier();
+    if (lid == 0u) partial_max[0] = mx;
+    barrier();
+    mx = partial_max[0];
+
+    float ev = (col < p.dim) ? exp(val - mx) : 0.0;
+    partial_sum[lid] = ev;
+    barrier();
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial_sum[lid] += partial_sum[lid + stride];
+        }
+        barrier();
+    }
+
+    float s;
+    if (lid == 0u) s = partial_sum[0];
+    barrier();
+    if (lid == 0u) partial_sum[0] = 1.0 / s;
+    barrier();
+    s = partial_sum[0];
+
+    if (col < p.dim) {
+        x[base + col] = ev * s;
+    }
+}

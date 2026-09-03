@@ -1,0 +1,13 @@
+build/
+build-no-vulkan/
+*.spv
+*.gguf
+*.log
+compile_commands.json
+
+build-asan/
+build-full/
+build-bundled/
+build-core/
+build-cpu-*/
+third_party/*/build*/

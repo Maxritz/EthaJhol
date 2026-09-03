@@ -1,0 +1,26 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer Data { float qk[]; };
+layout(push_constant) uniform Params { uint head_dim; uint n_rot; float freq_scale; float theta_base; uint pos; uint half_dim; } p;
+
+void main() {
+    uint linear = gl_GlobalInvocationID.x;
+    uint total = (p.head_dim / 2u) * (p.head_dim / p.n_rot);
+    if (linear >= total) return;
+
+    uint pair_idx = linear % (p.head_dim / 2u);
+    uint head = linear / (p.head_dim / 2u);
+    uint base = head * p.head_dim;
+
+    if (pair_idx >= p.n_rot) return;
+
+    float freq = float(p.pos) * p.freq_scale / pow(p.theta_base, float(2u * pair_idx) / float(p.head_dim));
+    float cos_val = cos(freq);
+    float sin_val = sin(freq);
+
+    float q0 = qk[base + pair_idx];
+    float q1 = qk[base + pair_idx + p.half_dim];
+    qk[base + pair_idx] = q0 * cos_val - q1 * sin_val;
+    qk[base + pair_idx + p.half_dim] = q0 * sin_val + q1 * cos_val;
+}

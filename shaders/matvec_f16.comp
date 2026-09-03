@@ -1,0 +1,41 @@
+#version 450
+
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer Weights { uint w[]; };
+layout(std430, binding = 1) readonly buffer Scales  { uint s[]; };
+layout(std430, binding = 2) readonly buffer Input   { float x[]; };
+layout(std430, binding = 3) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Params { uint rows; uint input_dim; uint output_dim; } p;
+
+float decode_f16(uint h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mantissa = h & 0x3ffu;
+    uint f;
+    if (exp == 0u) { f = (sign << 31u) | (mantissa != 0u ? ((mantissa << 13u) + ((127u - 14u) << 23u)) : 0u); }
+    else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
+    else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
+    return uintBitsToFloat(f);
+}
+
+uint load_u16(uint index) {
+    uint word = w[index >> 1u];
+    return (index & 1u) == 0u ? (word & 0xffffu) : (word >> 16u);
+}
+
+void main() {
+    uint linear = gl_GlobalInvocationID.x;
+    uint total = p.rows * p.output_dim;
+    if (linear >= total) return;
+    uint row = linear / p.output_dim;
+    uint o = linear - row * p.output_dim;
+    float acc = 0.0;
+    uint base = o * p.input_dim;
+    uint xbase = row * p.input_dim;
+    for (uint k = 0u; k < p.input_dim; ++k) {
+        acc += decode_f16(load_u16(base + k)) * x[xbase + k];
+    }
+    uint scale_val = s[o >> 1u];
+    float sc = decode_f16((o & 1u) == 0u ? (scale_val & 0xffffu) : (scale_val >> 16u));
+    y[linear] = acc * sc;
+}

@@ -1,0 +1,15 @@
+#version 450
+
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer GateBuf { float gate[]; };
+layout(std430, binding = 1) readonly buffer UpBuf  { float up[]; };
+layout(std430, binding = 2) writeonly buffer OutBuf { float result[]; };
+layout(push_constant) uniform Params { uint dim; } p;
+
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= p.dim) return;
+    float g = gate[i];
+    float s = g / (1.0 + exp(-g));
+    result[i] = s * up[i];
+}
