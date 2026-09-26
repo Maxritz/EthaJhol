@@ -24,6 +24,10 @@ size_t vg_tokenizer_decode(const VG_Tokenizer *tok, int32_t id, char *buf, size_
 /* Number of tokens in the vocabulary. */
 size_t vg_tokenizer_vocab_size(const VG_Tokenizer *tok);
 
+/* BOS/EOS token IDs. */
+int32_t vg_tokenizer_bos_id(const VG_Tokenizer *tok);
+int32_t vg_tokenizer_eos_id(const VG_Tokenizer *tok);
+
 #ifdef __cplusplus
 }
 #endif

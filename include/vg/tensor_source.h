@@ -38,6 +38,16 @@ typedef struct VG_TensorSourceStats {
     uint64_t evictions;
 } VG_TensorSourceStats;
 
+typedef struct VG_PrefetchEntry {
+    const char *name;
+    VG_Tier tier;
+    void *data;
+    size_t bytes;
+    volatile int ready;
+    int error;
+    void *io_req;
+} VG_PrefetchEntry;
+
 typedef struct VG_TensorSourceConfig {
     size_t host_budget_bytes;
     size_t pinned_budget_bytes;
@@ -57,6 +67,9 @@ VG_Status vg_tensor_acquire(VG_TensorSource *source, const char *name,
 void vg_tensor_release(VG_TensorLease *lease);
 VG_Status vg_tensor_prefetch(VG_TensorSource *source, const char *const *names,
                              size_t count, VG_Tier desired);
+VG_Status vg_tensor_prefetch_async(VG_TensorSource *source, const char *name,
+                                   VG_Tier desired, VG_PrefetchEntry *entry);
+VG_Status vg_tensor_wait(VG_TensorSource *source, VG_PrefetchEntry *entry);
 void vg_tensor_source_stats(const VG_TensorSource *source, VG_TensorSourceStats *out);
 
 /* One-shot streaming read used by kernels that fuse dequantize with compute. */

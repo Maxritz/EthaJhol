@@ -8,7 +8,7 @@
 
 /* --- Quantized block structures (matching GGUF ggml format) --- */
 typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;
-typedef struct { uint16_t d; uint8_t qs[32]; } block_q4_0;
+typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0; /* Q4_0: fp16 d + 16B packed nibbles = 18B/block (must match VG_QUANT_Q4_0 bytes_per_block=18 in quant.c) */
 typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; } block_q4_K;
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_K;
 

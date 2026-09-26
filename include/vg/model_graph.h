@@ -32,6 +32,9 @@ typedef struct VG_ModelConfig {
     int has_gate_up;
     int is_swa;
     uint32_t n_ctx;
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t sliding_window;
 } VG_ModelConfig;
 
 VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGraph **out);
@@ -44,6 +47,17 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *graph, int32_t input_token,
 VG_Status vg_model_graph_embed(VG_ModelGraph *graph, int32_t token, float *embd_out);
 const float *vg_model_graph_logits(const VG_ModelGraph *graph);
 void vg_model_graph_reset(VG_ModelGraph *graph);
+
+typedef struct VG_MoEState {
+    uint32_t n_expert;
+    uint32_t n_expert_used;
+    uint32_t *expert_ids;
+} VG_MoEState;
+
+VG_Status vg_model_graph_moe_route(VG_ModelGraph *graph, uint32_t layer,
+                                   const float *hidden, float *gate_logits,
+                                   VG_MoEState *state);
+void vg_moe_state_free(VG_MoEState *state);
 
 #ifdef VG_HAS_VULKAN
 void vg_model_graph_set_vulkan(VG_ModelGraph *graph, VG_VK *vk);

@@ -24,6 +24,7 @@ struct VG_ModelGraph {
     uint32_t n_rope_freqs;
     float **kv_k;
     float **kv_v;
+    uint32_t *kv_dim;   /* actual per-layer KV dim from tensor shapes */
     uint32_t kv_capacity;
     uint32_t kv_used;
 #ifdef VG_HAS_VULKAN
@@ -226,8 +227,9 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
         uint32_t n_pages = (g->cfg.n_ctx + kv_page - 1) / kv_page;
         g->kv_k = (float **)calloc(g->cfg.n_layer * n_pages, sizeof(float *));
         g->kv_v = (float **)calloc(g->cfg.n_layer * n_pages, sizeof(float *));
-        if (!g->kv_k || !g->kv_v) {
-            free(g->kv_k); free(g->kv_v);
+        g->kv_dim = (uint32_t *)calloc(g->cfg.n_layer, sizeof(uint32_t));
+        if (!g->kv_k || !g->kv_v || !g->kv_dim) {
+            free(g->kv_k); free(g->kv_v); free(g->kv_dim);
             free(g->work_embd); free(g->work_ffn); free(g->work_qkv);
             free(g->work_att_out); free(g->work_head); free(g->work_res);
             free(g->logits);
@@ -255,17 +257,19 @@ void vg_model_graph_free(VG_ModelGraph *g) {
         }
         free(g->kv_k); free(g->kv_v);
     }
-    if (g->kv_v) { for (uint32_t i = 0; i < g->cfg.n_layer; ++i) free(g->kv_v[i]); free(g->kv_v); }
+    free(g->kv_dim);
     free(g);
 }
 
 void vg_model_graph_reset(VG_ModelGraph *g) {
     if (!g) return;
-    uint32_t KV_dim = g->cfg.n_head_kv * g->cfg.head_dim;
     uint32_t page_tokens = 64;
     for (uint32_t i = 0; i < g->cfg.n_layer * g->kv_capacity; ++i) {
-        if (g->kv_k[i]) memset(g->kv_k[i], 0, page_tokens * KV_dim * sizeof(float));
-        if (g->kv_v[i]) memset(g->kv_v[i], 0, page_tokens * KV_dim * sizeof(float));
+        if (g->kv_k[i]) {
+            uint32_t d = g->kv_dim[i / g->kv_capacity];
+            memset(g->kv_k[i], 0, page_tokens * d * sizeof(float));
+            memset(g->kv_v[i], 0, page_tokens * d * sizeof(float));
+        }
     }
     g->kv_used = 0;
 }
@@ -481,6 +485,7 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             if (!g->kv_k[lp]) {
                 g->kv_k[lp] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
                 g->kv_v[lp] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
+                g->kv_dim[layer] = KV_dim;
             }
             if (g->kv_k[lp] && k_full) memcpy(g->kv_k[lp] + slot_off, k_full, KV_dim * sizeof(float));
             if (g->kv_v[lp] && v_full) memcpy(g->kv_v[lp] + slot_off, v_full, KV_dim * sizeof(float));
