@@ -364,7 +364,7 @@ static int chat_mode(const char *path, const char *system_prompt) {
             snprintf(prompt, sizeof(prompt), "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n%s<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n", line);
         }
         fprintf(stderr, "Assistant: ");
-        VG_GenerateConfig c; memset(&c, 0, sizeof(c)); c.n_predict = 512; c.n_ctx = 4096; c.n_batch = 512; c.n_gpu_layers = 99; c.seed = 0xffffffffu; c.top_k = 40; c.top_p = 0.95f; c.temperature = 0.7f; c.repeat_penalty = 1.1f; c.repeat_last_n = 64; c.lazy_mode = 2; c.load_mode = 1; c.use_mmap = 1;
+        VG_GenerateConfig c; memset(&c, 0, sizeof(c)); c.n_predict = 512; c.n_ctx = 4096; c.seed = 0xffffffffu; c.top_k = 40; c.top_p = 0.95f; c.temperature = 0.7f; c.repeat_penalty = 1.1f; c.repeat_last_n = 64; c.use_mmap = 1;
         VG_Status st = vg_generate(path, prompt, &c, emit_stdout, NULL);
         fprintf(stderr, "\n\n");
         if (st != VG_OK) { fprintf(stderr, "generate failed: %s\n", status_name(st)); break; }

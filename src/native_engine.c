@@ -2,9 +2,13 @@
 #include "vg/model_graph.h"
 #include "vg/tensor_source.h"
 #include "vg/tokenizer.h"
+#ifdef VG_HAS_VULKAN
+#include "vg/vulkan_backend.h"
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdio.h>
 
 static int32_t sample_next_token(const float *logits, uint32_t n_vocab,
                                   float temperature, int32_t top_k, float top_p,
@@ -96,7 +100,15 @@ static int32_t sample_next_token(const float *logits, uint32_t n_vocab,
     return result;
 }
 
-VG_Status vg_generate_native(const char *model_path, const char *prompt,
+#ifdef VG_HAS_VULKAN
+static const char *shader_dir(void) {
+    FILE *f = fopen("shaders/matvec_i8.comp.spv", "rb"); if (f) { fclose(f); return "shaders"; }
+    f = fopen("build/shaders/matvec_i8.comp.spv", "rb"); if (f) { fclose(f); return "build/shaders"; }
+    return "shaders";
+}
+#endif
+
+VG_Status vg_generate(const char *model_path, const char *prompt,
                               const VG_GenerateConfig *config,
                               VG_TokenCallback callback, void *user) {
     VG_GGUF *file = NULL;
@@ -109,10 +121,26 @@ VG_Status vg_generate_native(const char *model_path, const char *prompt,
     scfg.io_chunk_bytes = 4u * 1024u * 1024u;
     scfg.use_mmap = 1;
     st = vg_tensor_source_open(file, &scfg, &source);
+    fprintf(stderr, "[dbg] tensor_source_open: st=%d source=%p\n", (int)st, (void*)source);
 
     VG_ModelGraph *graph = NULL;
     st = vg_model_graph_load(file, source, &graph);
-    if (st != VG_OK) { if (source) vg_tensor_source_close(source); vg_gguf_close(file); return st; }
+    fprintf(stderr, "[dbg] model_graph_load: st=%d graph=%p\n", (int)st, (void*)graph);
+    if (st != VG_OK) { fprintf(stderr, "[vg-trace] FAIL: vg_model_graph_load = %d\n", (int)st); if (source) vg_tensor_source_close(source); vg_gguf_close(file); return st; }
+
+#ifdef VG_HAS_VULKAN
+    if (config && config->use_gpu) {
+        VG_VKConfig vkcfg; memset(&vkcfg, 0, sizeof(vkcfg));
+        vkcfg.shader_dir = shader_dir();
+        VG_VK *vk = NULL;
+        if (vg_vk_open(&vkcfg, &vk) == VG_OK && vk) {
+            vg_model_graph_set_vulkan(graph, vk);
+            fprintf(stderr, "[vg-trace] Vulkan enabled for inference\n");
+        } else {
+            fprintf(stderr, "[vg-trace] WARN: Vulkan init failed, falling back to CPU\n");
+        }
+    }
+#endif
 
     vg_model_graph_reset(graph);
 
@@ -145,7 +173,7 @@ VG_Status vg_generate_native(const char *model_path, const char *prompt,
     if (st != VG_OK) goto done;
     for (size_t i = 0; i < n_prompt_tokens && kv_pos < n_ctx; ++i) {
         st = vg_model_graph_decode(graph, prompt_tokens[i], kv_pos++, logits);
-        if (st != VG_OK) break;
+        if (st != VG_OK) { fprintf(stderr, "[dbg] decode prompt token %zu failed st=%d\n", i, (int)st); break; }
     }
     free(prompt_tokens); prompt_tokens = NULL;
 
@@ -159,6 +187,7 @@ VG_Status vg_generate_native(const char *model_path, const char *prompt,
     /* Decode */
     for (int32_t gen = 0; gen < n_predict && kv_pos < n_ctx; ++gen) {
         int32_t next = sample_next_token(logits, mcfg->n_vocab, temp, top_k, top_p_val, &rng_state);
+        fprintf(stderr, "[dbg] sampled token=%d logits[0]=%.4f logits[%d]=%.4f\n", next, logits[0], next, logits[next]);
         if (next == eos) break;
 
         char buf[256]; buf[0] = 0;
@@ -172,11 +201,12 @@ VG_Status vg_generate_native(const char *model_path, const char *prompt,
     }
 
 done:
-    free(logits);
+    fprintf(stderr, "[dbg] cleanup: logits\n"); free(logits);
     if (prompt_tokens) free(prompt_tokens);
-    vg_tokenizer_free(tok);
-    vg_model_graph_free(graph);
-    if (source) vg_tensor_source_close(source);
-    vg_gguf_close(file);
-    return VG_OK;
+    fprintf(stderr, "[dbg] cleanup: tokenizer\n"); vg_tokenizer_free(tok);
+    fprintf(stderr, "[dbg] cleanup: graph\n"); vg_model_graph_free(graph);
+    fprintf(stderr, "[dbg] cleanup: source\n"); if (source) vg_tensor_source_close(source);
+    fprintf(stderr, "[dbg] cleanup: gguf\n"); vg_gguf_close(file);
+    fprintf(stderr, "[dbg] cleanup: done\n");
+    return st;
 }

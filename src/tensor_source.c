@@ -1,12 +1,14 @@
 #include "vg/tensor_source.h"
 #include "vg/trace.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #ifdef _WIN32
 #include <windows.h>
 #else
 #include <pthread.h>
+#include <time.h>
 #endif
 
 typedef struct VG_CacheEntry {
@@ -20,6 +22,17 @@ typedef struct VG_CacheEntry {
     int owns;
 } VG_CacheEntry;
 
+typedef struct VG_IORequest {
+    const char *name;
+    VG_Tier tier;
+    void *data;
+    size_t bytes;
+    int ready;
+    int error;
+    VG_PrefetchEntry *io_entry;
+    struct VG_IORequest *next;
+} VG_IORequest;
+
 struct VG_TensorSource {
     VG_GGUF *file;
     VG_TensorSourceConfig cfg;
@@ -31,9 +44,15 @@ struct VG_TensorSource {
     VG_TensorSourceStats stats;
 #ifdef _WIN32
     CRITICAL_SECTION lock;
+    HANDLE io_thread;
+    int io_running;
 #else
     pthread_mutex_t lock;
+    pthread_t io_thread;
+    int io_running;
 #endif
+    VG_IORequest *io_queue_head;
+    VG_IORequest *io_queue_tail;
 };
 
 static void lock_src(VG_TensorSource *s) {
@@ -48,6 +67,62 @@ static void unlock_src(VG_TensorSource *s) {
     LeaveCriticalSection(&s->lock);
 #else
     (void)pthread_mutex_unlock(&s->lock);
+#endif
+}
+
+#ifdef _WIN32
+static DWORD WINAPI io_worker_win(LPVOID param) {
+    VG_TensorSource *s = (VG_TensorSource *)param;
+    while (1) {
+#else
+static void *io_worker(void *param) {
+    VG_TensorSource *s = (VG_TensorSource *)param;
+    while (1) {
+#endif
+        VG_IORequest *req = NULL;
+        lock_src(s);
+        if (s->io_queue_head) {
+            req = s->io_queue_head;
+            s->io_queue_head = req->next;
+            if (!s->io_queue_head) s->io_queue_tail = NULL;
+        }
+        unlock_src(s);
+        if (!req) {
+            int running;
+            lock_src(s); running = s->io_running; unlock_src(s);
+            if (!running) {
+#ifdef _WIN32
+                return 0;
+#else
+                return NULL;
+#endif
+            }
+            #ifdef _WIN32
+            Sleep(1);
+            #else
+            struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+            #endif
+            continue;
+        }
+        const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, req->name);
+        if (!t) { req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        req->bytes = (size_t)t->nbytes;
+        req->data = malloc(req->bytes ? req->bytes : 1);
+        if (!req->data) { req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        VG_Status st = vg_gguf_read(s->file, t, 0, req->data, req->bytes);
+        if (st != VG_OK) { free(req->data); req->data = NULL; req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        req->ready = 1;
+        if (req->io_entry) {
+            req->io_entry->data = req->data;
+            req->io_entry->bytes = req->bytes;
+            req->io_entry->ready = 1;
+            req->io_entry->error = 0;
+        }
+    }
+#ifdef _WIN32
+    return 0;
+#else
+    return NULL;
 #endif
 }
 static size_t resident_bytes(const VG_TensorSource *s) {
@@ -77,13 +152,33 @@ VG_Status vg_tensor_source_open(VG_GGUF *file, const VG_TensorSourceConfig *cfg,
     if (s->cfg.use_direct_io) vg_gguf_set_direct_io(file, 1);
 #ifdef _WIN32
     InitializeCriticalSection(&s->lock);
+    if (s->cfg.io_workers > 0) {
+        s->io_running = 1;
+        s->io_thread = CreateThread(NULL, 0, io_worker_win, s, 0, NULL);
+        if (!s->io_thread) { DeleteCriticalSection(&s->lock); free(s); return VG_E_NOMEM; }
+    }
 #else
     if (pthread_mutex_init(&s->lock, NULL) != 0) { free(s); return VG_E_BUSY; }
+    if (s->cfg.io_workers > 0) {
+        s->io_running = 1;
+        if (pthread_create(&s->io_thread, NULL, io_worker, s) != 0) { pthread_mutex_destroy(&s->lock); free(s); return VG_E_NOMEM; }
+    }
 #endif
     *out = s; return VG_OK;
 }
+
 void vg_tensor_source_close(VG_TensorSource *s) {
-    if (!s) return; lock_src(s); for (size_t i = 0; i < s->count; ++i) if (s->entries[i].owns) free(s->entries[i].data); free(s->entries); unlock_src(s);
+    if (!s) return;
+    if (s->io_thread) {
+        s->io_running = 0;
+        #ifdef _WIN32
+        WaitForSingleObject(s->io_thread, 5000); CloseHandle(s->io_thread);
+        #else
+        pthread_join(s->io_thread, NULL);
+        #endif
+    }
+    lock_src(s); for (size_t i = 0; i < s->count; ++i) if (s->entries[i].owns) free(s->entries[i].data); free(s->entries); unlock_src(s);
+    while (s->io_queue_head) { VG_IORequest *n = s->io_queue_head->next; free((void*)s->io_queue_head); s->io_queue_head = n; }
 #ifdef _WIN32
     DeleteCriticalSection(&s->lock);
 #else
@@ -134,6 +229,39 @@ void vg_tensor_release(VG_TensorLease *lease) {
 VG_Status vg_tensor_prefetch(VG_TensorSource *s, const char *const *names, size_t count, VG_Tier desired) {
     if (!s || (!names && count)) return VG_E_INVALID;
     for (size_t i = 0; i < count; ++i) { VG_TensorLease l; VG_Status st = vg_tensor_acquire(s, names[i], desired, &l); if (st != VG_OK) return st; vg_tensor_release(&l); ++s->stats.prefetches; }
+    return VG_OK;
+}
+VG_Status vg_tensor_prefetch_async(VG_TensorSource *s, const char *name, VG_Tier desired, VG_PrefetchEntry *entry) {
+    if (!s || !name || !entry) return VG_E_INVALID;
+    memset(entry, 0, sizeof(*entry));
+    entry->name = name;
+    entry->tier = desired;
+    if (!s->io_thread) return vg_tensor_prefetch(s, &name, 1, desired);
+    lock_src(s);
+    VG_IORequest *req = (VG_IORequest *)calloc(1, sizeof(VG_IORequest));
+    if (!req) { unlock_src(s); return VG_E_NOMEM; }
+    req->name = name;
+    req->tier = desired;
+    req->io_entry = entry;
+    if (s->io_queue_tail) { s->io_queue_tail->next = req; s->io_queue_tail = req; }
+    else { s->io_queue_head = s->io_queue_tail = req; }
+    unlock_src(s);
+    return VG_OK;
+}
+VG_Status vg_tensor_wait(VG_TensorSource *s, VG_PrefetchEntry *entry) {
+    if (!s || !entry) return VG_E_INVALID;
+    while (1) {
+        lock_src(s);
+        int ready = 0;
+        if (entry->ready) ready = 1;
+        unlock_src(s);
+        if (ready) return entry->error ? VG_E_IO : VG_OK;
+        #ifdef _WIN32
+        Sleep(1);
+        #else
+        struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+        #endif
+    }
     return VG_OK;
 }
 void vg_tensor_source_stats(const VG_TensorSource *sc, VG_TensorSourceStats *out) { if (!sc || !out) return; VG_TensorSource *s = (VG_TensorSource *)sc; lock_src(s); *out = s->stats; unlock_src(s); }

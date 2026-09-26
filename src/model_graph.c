@@ -14,7 +14,9 @@ struct VG_ModelGraph {
     float *work_embd;
     float *work_ffn;
     float *work_qkv;
+    uint32_t work_qkv_cap;
     float *work_att_out;
+    uint32_t work_att_out_cap;
     float *work_head;
     float *work_res;
     float *logits;
@@ -41,7 +43,7 @@ static VG_Status vk_matmul(VG_ModelGraph *g, uint32_t ggml_type, const void *wda
 #endif
 
 static VG_Status acquire_weight(VG_ModelGraph *g, const char *name, VG_TensorLease *lease) {
-    if (g->source) return vg_tensor_acquire(g->source, name, VG_TIER_HOST, lease);
+    if (g->source) return vg_tensor_acquire(g->source, name, VG_TIER_STORAGE, lease);
     const VG_GGUF_Tensor *t = find_tensor(g, name); if (!t) return VG_E_INVALID;
     void *data = malloc(t->nbytes ? t->nbytes : 1); if (!data) return VG_E_NOMEM;
     VG_Status st = vg_gguf_read(g->file, t, 0, data, t->nbytes);
@@ -70,7 +72,9 @@ static VG_Status read_metadata_float(const VG_ModelGraph *g, const char *key, fl
     if (!v) return VG_E_INVALID;
     const char *p = v;
     while (*p == '[' || *p == ' ' || *p == ',') ++p;
-    *out = strtof(p, NULL);
+    float val = strtof(p, NULL);
+    if (!isfinite(val)) return VG_E_INVALID;
+    *out = val;
     return VG_OK;
 }
 
@@ -113,18 +117,21 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
 
     if (g->cfg.n_head_kv == 0) g->cfg.n_head_kv = g->cfg.n_head;
     if (g->cfg.head_dim == 0) {
-        /* Try to derive from attn_q.weight dims: dims[0] = n_head * head_dim */
+        /* Try to derive from attn_q.weight dims: dims[1] = n_head * head_dim (out dim) */
         const VG_GGUF_Tensor *q = find_tensor(g, "blk.0.attn_q.weight");
-        if (q && q->n_dims >= 1 && g->cfg.n_head) {
-            g->cfg.head_dim = (uint32_t)(q->dims[0] / g->cfg.n_head);
+        if (q && q->n_dims >= 2 && g->cfg.n_head) {
+            g->cfg.head_dim = (uint32_t)(q->dims[1] / g->cfg.n_head);
         }
         if (g->cfg.head_dim == 0) g->cfg.head_dim = g->cfg.n_embd / (g->cfg.n_head ? g->cfg.n_head : 1);
     }
+    /* n_rot from metadata may be total (key_length); clamp to head_dim */
     if (g->cfg.n_rot == 0) g->cfg.n_rot = g->cfg.head_dim;
+    if (g->cfg.n_rot > g->cfg.head_dim) g->cfg.n_rot = g->cfg.head_dim;
     READ_FLOAT(rms_eps, attention.layer_norm_rms_epsilon);
-    if (g->cfg.rms_eps == 0.0f) g->cfg.rms_eps = 1e-5f;
+    if (!isfinite(g->cfg.rms_eps) || g->cfg.rms_eps <= 0.0f) g->cfg.rms_eps = 1e-5f;
     READ_FLOAT(freq_base, rope.freq_base);
-    if (g->cfg.freq_base == 0.0f) g->cfg.freq_base = 10000.0f;
+    /* freq_base of 1e-23 or non-finite indicates corrupt/missing metadata; use gemma4 default */
+    if (!isfinite(g->cfg.freq_base) || g->cfg.freq_base < 1.0f) g->cfg.freq_base = 100000.0f;
 
     /* Load optional rope_freqs.weight tensor (precomputed RoPE frequencies) */
     {
@@ -137,10 +144,12 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
                 if (st != VG_OK) {
                     free(g->rope_freqs); g->rope_freqs = NULL; g->n_rope_freqs = 0;
                 } else {
-                    /* Fall back to theta formula if rope_freqs have invalid values */
+                    /* Fall back to theta formula if rope_freqs have invalid/unpopulated values */
                     int valid = 1;
                     for (uint32_t i = 0; i < g->n_rope_freqs; ++i) {
-                        if (!isfinite(g->rope_freqs[i]) || g->rope_freqs[i] <= 0.0f) { valid = 0; break; }
+                        if (!isfinite(g->rope_freqs[i]) || g->rope_freqs[i] <= 0.0f || g->rope_freqs[i] > 1.0e6f) {
+                            valid = 0; break;
+                        }
                     }
                     if (!valid) {
                         fprintf(stderr, "[dbg] rope_freqs has invalid values, using theta formula\n");
@@ -172,6 +181,10 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
         g->cfg.sliding_window = (sw > 0) ? (uint32_t)sw : 512;
     }
 
+    fprintf(stderr, "[dbg] model config: arch=%s n_vocab=%u n_embd=%u n_head=%u n_head_kv=%u n_layer=%u n_ff=%u head_dim=%u n_rot=%u n_ctx=%u rms_eps=%.2e freq_base=%.1f\n",
+            arch, g->cfg.n_vocab, g->cfg.n_embd, g->cfg.n_head, g->cfg.n_head_kv,
+            g->cfg.n_layer, g->cfg.n_ff, g->cfg.head_dim, g->cfg.n_rot, g->cfg.n_ctx, g->cfg.rms_eps, g->cfg.freq_base);
+
     snprintf(key, sizeof(key), "%s.bos_token_id", "tokenizer.ggml");
     read_metadata_int(g, key, &g->cfg.bos_id);
     snprintf(key, sizeof(key), "%s.eos_token_id", "tokenizer.ggml");
@@ -194,7 +207,9 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
     g->work_embd = (float *)malloc(embd_bytes);
     g->work_ffn = (float *)malloc(ff_bytes);
     g->work_qkv = (float *)malloc(qkv_bytes);
+    g->work_qkv_cap = q_total;
     g->work_att_out = (float *)malloc((g->cfg.n_head * h_dim + 1) * sizeof(float));
+    g->work_att_out_cap = g->cfg.n_head * h_dim + 1;
     g->work_head = (float *)malloc(g->cfg.head_dim * sizeof(float));
     g->work_res = (float *)malloc(embd_bytes);
     g->logits = (float *)malloc(logits_bytes);
@@ -218,8 +233,8 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
             free(g->logits);
             free(g); return VG_E_NOMEM;
         }
-        g->kv_capacity = n_pages;
-        g->kv_used = 0;
+    g->kv_capacity = n_pages;
+    g->kv_used = 0;
     }
 
     *out = g;
@@ -297,15 +312,13 @@ static float vec_rms(const float *x, uint32_t n, float eps) {
 static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, float *cur_pos_f) {
     uint32_t D = g->cfg.n_embd;
     uint32_t H = g->cfg.n_head;
-    uint32_t HKV = g->cfg.n_head_kv;
-    uint32_t HD = g->cfg.head_dim;
-    uint32_t KV_dim = HKV * HD;
-    uint32_t n_rot = g->cfg.n_rot;
+    uint32_t HKV = g->cfg.n_head_kv ? g->cfg.n_head_kv : 1;
     uint32_t pos = (uint32_t)*cur_pos_f;
     char name[128];
     VG_TensorLease l;
+    VG_TensorLease nl;
+    if (layer < 2 && pos < 2) fprintf(stderr, "[dbg] attn_layer layer=%u D=%u H=%u HKV=%u pos=%u\n", layer, D, H, HKV, pos);
 
-    /* Save original hidden for residual (hidden may alias work_embd) */
     memcpy(g->work_res, hidden, D * sizeof(float));
 
     snprintf(name, sizeof(name), "blk.%u.attn_norm.weight", layer);
@@ -316,50 +329,61 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         memcpy(g->work_embd, hidden, D * sizeof(float));
     }
 
-    /* Q projection */
-    uint32_t Q_dim = H * HD;
+    uint32_t Q_dim = H * g->cfg.head_dim;
+    uint32_t HD = g->cfg.head_dim;
+    uint32_t KV_dim = HKV * HD;
+    uint32_t n_rot = g->cfg.n_rot ? (g->cfg.n_rot < HD ? g->cfg.n_rot : HD) : HD;
+    float *q_proj = NULL, *k_full = NULL, *v_full = NULL;
+
     snprintf(name, sizeof(name), "blk.%u.attn_q.weight", layer);
-    if (acquire_weight(g, name, &l) == VG_OK) {
-        float *q_proj = (float *)malloc(Q_dim * sizeof(float));
-        if (q_proj) {
-#ifdef VG_HAS_VULKAN
-            if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, q_proj, Q_dim, D) == VG_OK) {
-                /* Vulkan dispatch succeeded */
-            } else
-#endif
-            {
-                vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, q_proj, Q_dim, D);
-            }
-            for (uint32_t h = 0; h < H; ++h) {
-                float *hq = q_proj + h * HD;
-                /* Apply QK-norm if present (e.g., Gemma models) */
-                char qnorm_name[128]; snprintf(qnorm_name, sizeof(qnorm_name), "blk.%u.attn_q_norm.weight", layer);
-                if (acquire_weight(g, qnorm_name, &l) == VG_OK) {
-                    const float *qn = (const float *)l.data;
-                    float inv = vec_rms(hq, HD, 1e-6f);
-                    for (uint32_t i = 0; i < HD; ++i) hq[i] = hq[i] * inv * qn[i];
-                    release_weight(&l);
-                }
-                if (g->rope_freqs && g->n_rope_freqs >= n_rot) {
-                    /* Use precomputed rope_freqs tensor */
-                    uint32_t half = HD / 2;
-                    uint32_t iters = n_rot ? (n_rot < half ? n_rot : half) : half;
-                    for (uint32_t i = 0; i < iters; ++i) {
-                        float freq = pos * g->rope_freqs[i];
-                        float c = cosf(freq), s = sinf(freq);
-                        float q0 = hq[i], q1 = hq[i + half];
-                        hq[i] = q0 * c - q1 * s;
-                        hq[i + half] = q0 * s + q1 * c;
-                    }
-                } else {
-                    vg_cpu_rope(hq, hq, HD, n_rot, 1.0f, g->cfg.freq_base, (int32_t)pos);
-                }
-            }
-            memcpy(g->work_qkv, q_proj, Q_dim * sizeof(float));
-            free(q_proj);
-        }
-        release_weight(&l);
+    if (acquire_weight(g, name, &l) != VG_OK) {
+        memcpy(hidden, g->work_res, D * sizeof(float));
+        return;
     }
+    if (l.tensor->n_dims >= 2 && l.tensor->dims[1] >= 1) Q_dim = (uint32_t)l.tensor->dims[1];
+    HD = H ? (Q_dim / H) : g->cfg.head_dim;
+    n_rot = g->cfg.n_rot ? (g->cfg.n_rot < HD ? g->cfg.n_rot : HD) : HD;
+
+    uint32_t need_qkv = Q_dim + 2 * KV_dim;
+    if (need_qkv > g->work_qkv_cap) {
+        float *tmp = (float *)realloc(g->work_qkv, need_qkv * sizeof(float));
+        if (tmp) { g->work_qkv = tmp; g->work_qkv_cap = need_qkv; }
+    }
+    q_proj = (float *)malloc(Q_dim * sizeof(float));
+    if (q_proj) {
+        if (layer < 2 && pos < 2) fprintf(stderr, "[dbg] layer %u Q out=%u in=%u type=%u HD=%u n_rot=%u\n", layer, Q_dim, D, l.tensor->ggml_type, HD, n_rot);
+#ifdef VG_HAS_VULKAN
+        if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, q_proj, Q_dim, D) == VG_OK) { } else
+#endif
+        { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, q_proj, Q_dim, D); }
+
+        for (uint32_t h = 0; h < H; ++h) {
+            float *hq = q_proj + h * HD;
+            char qn_name[128]; snprintf(qn_name, sizeof(qn_name), "blk.%u.attn_q_norm.weight", layer);
+            if (acquire_weight(g, qn_name, &nl) == VG_OK) {
+                const float *qn = (const float *)nl.data;
+                float inv = vec_rms(hq, HD, 1e-6f);
+                for (uint32_t i = 0; i < HD; ++i) hq[i] = hq[i] * inv * qn[i];
+                release_weight(&nl);
+            }
+            if (g->rope_freqs && g->n_rope_freqs >= n_rot) {
+                uint32_t half = HD / 2;
+                uint32_t iters = n_rot < half ? n_rot : half;
+                for (uint32_t i = 0; i < iters; ++i) {
+                    float freq = pos * g->rope_freqs[i];
+                    float c = cosf(freq), s = sinf(freq);
+                    float a = hq[i], b = hq[i + half];
+                    hq[i] = a * c - b * s; hq[i + half] = a * s + b * c;
+                }
+            } else {
+                vg_cpu_rope(hq, hq, HD, n_rot, 1.0f, g->cfg.freq_base, (int32_t)pos);
+            }
+        }
+        memcpy(g->work_qkv, q_proj, Q_dim * sizeof(float));
+        free(q_proj);
+    }
+    release_weight(&l);
+
     if (g->cfg.has_biases) {
         snprintf(name, sizeof(name), "blk.%u.attn_q.bias", layer);
         if (acquire_weight(g, name, &l) == VG_OK) {
@@ -369,47 +393,43 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         }
     }
 
-    /* K projection */
-    float *k_full = (float *)malloc(KV_dim * sizeof(float));
     snprintf(name, sizeof(name), "blk.%u.attn_k.weight", layer);
-    if (k_full && acquire_weight(g, name, &l) == VG_OK) {
+    if (acquire_weight(g, name, &l) == VG_OK) {
+        uint32_t kdim = (l.tensor->n_dims >= 2 && l.tensor->dims[1] >= 1) ? (uint32_t)l.tensor->dims[1] : KV_dim;
+        if (kdim != KV_dim) { need_qkv = Q_dim + 2 * kdim; if (need_qkv > g->work_qkv_cap) { float *t=realloc(g->work_qkv,need_qkv*sizeof(float)); if(t){g->work_qkv=t;g->work_qkv_cap=need_qkv;} } KV_dim = kdim; }
+        k_full = (float *)malloc(KV_dim * sizeof(float));
+        if (k_full) {
 #ifdef VG_HAS_VULKAN
-        if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, k_full, KV_dim, D) == VG_OK) {
-            /* Vulkan dispatch succeeded */
-        } else
+            if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, k_full, KV_dim, D) == VG_OK) { } else
 #endif
-        {
-            vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, k_full, KV_dim, D);
+            { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, k_full, KV_dim, D); }
+            uint32_t k_hdim = HKV ? (KV_dim / HKV) : HD;
+            for (uint32_t h = 0; h < HKV; ++h) {
+                float *hk = k_full + h * k_hdim;
+                char kn_name[128]; snprintf(kn_name, sizeof(kn_name), "blk.%u.attn_k_norm.weight", layer);
+                if (acquire_weight(g, kn_name, &nl) == VG_OK) {
+                    const float *kn = (const float *)nl.data;
+                    float inv = vec_rms(hk, k_hdim, 1e-6f);
+                    for (uint32_t i = 0; i < k_hdim; ++i) hk[i] = hk[i] * inv * kn[i];
+                    release_weight(&nl);
+                }
+                if (g->rope_freqs && g->n_rope_freqs >= n_rot) {
+                    uint32_t half = k_hdim / 2;
+                    uint32_t iters = n_rot < half ? n_rot : half;
+                    for (uint32_t i = 0; i < iters; ++i) {
+                        float freq = pos * g->rope_freqs[i];
+                        float c = cosf(freq), s = sinf(freq);
+                        float a = hk[i], b = hk[i + half];
+                        hk[i] = a * c - b * s; hk[i + half] = a * s + b * c;
+                    }
+                } else {
+                    vg_cpu_rope(hk, hk, k_hdim, n_rot, 1.0f, g->cfg.freq_base, (int32_t)pos);
+                }
+            }
         }
         release_weight(&l);
-        /* Apply K-norm if present (e.g., Gemma models) */
-        char knorm_name[128]; snprintf(knorm_name, sizeof(knorm_name), "blk.%u.attn_k_norm.weight", layer);
-        if (acquire_weight(g, knorm_name, &l) == VG_OK) {
-            const float *kn = (const float *)l.data;
-            for (uint32_t h = 0; h < HKV; ++h) {
-                float *hk = k_full + h * HD;
-                float inv = vec_rms(hk, HD, 1e-6f);
-                for (uint32_t i = 0; i < HD; ++i) hk[i] = hk[i] * inv * kn[i];
-            }
-            release_weight(&l);
-        }
-        for (uint32_t h = 0; h < HKV; ++h) {
-            float *hk = k_full + h * HD;
-            if (g->rope_freqs && g->n_rope_freqs >= n_rot) {
-                uint32_t half = HD / 2;
-                uint32_t iters = n_rot ? (n_rot < half ? n_rot : half) : half;
-                for (uint32_t i = 0; i < iters; ++i) {
-                    float freq = pos * g->rope_freqs[i];
-                    float c = cosf(freq), s = sinf(freq);
-                    float k0 = hk[i], k1 = hk[i + half];
-                    hk[i] = k0 * c - k1 * s;
-                    hk[i + half] = k0 * s + k1 * c;
-                }
-            } else {
-                vg_cpu_rope(hk, hk, HD, n_rot, 1.0f, g->cfg.freq_base, (int32_t)pos);
-            }
-        }
     }
+
     if (g->cfg.has_biases && k_full) {
         snprintf(name, sizeof(name), "blk.%u.attn_k.bias", layer);
         if (acquire_weight(g, name, &l) == VG_OK) {
@@ -419,20 +439,20 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         }
     }
 
-    /* V projection */
-    float *v_full = (float *)malloc(KV_dim * sizeof(float));
     snprintf(name, sizeof(name), "blk.%u.attn_v.weight", layer);
-    if (v_full && acquire_weight(g, name, &l) == VG_OK) {
+    if (acquire_weight(g, name, &l) == VG_OK) {
+        uint32_t vdim = (l.tensor->n_dims >= 2 && l.tensor->dims[1] >= 1) ? (uint32_t)l.tensor->dims[1] : KV_dim;
+        if (vdim != KV_dim) { need_qkv = Q_dim + 2 * vdim; if (need_qkv > g->work_qkv_cap) { float *t=realloc(g->work_qkv,need_qkv*sizeof(float)); if(t){g->work_qkv=t;g->work_qkv_cap=need_qkv;} } KV_dim = vdim; }
+        v_full = (float *)malloc(KV_dim * sizeof(float));
+        if (v_full) {
 #ifdef VG_HAS_VULKAN
-        if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, v_full, KV_dim, D) == VG_OK) {
-            /* Vulkan dispatch succeeded */
-        } else
+            if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_embd, v_full, KV_dim, D) == VG_OK) { } else
 #endif
-        {
-            vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, v_full, KV_dim, D);
+            { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, v_full, KV_dim, D); }
         }
         release_weight(&l);
     }
+
     if (g->cfg.has_biases && v_full) {
         snprintf(name, sizeof(name), "blk.%u.attn_v.bias", layer);
         if (acquire_weight(g, name, &l) == VG_OK) {
@@ -442,7 +462,6 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         }
     }
 
-    /* Store K/V in KV cache (paged: 64-token pages allocated on demand) */
     uint32_t page_tokens = 64;
     uint32_t kv_capacity = g->kv_capacity;
     uint32_t slide_window = g->cfg.sliding_window;
@@ -457,75 +476,75 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
     if (pos < g->cfg.n_ctx) {
         uint32_t page_idx = pos / page_tokens;
         uint32_t slot_off = (pos % page_tokens) * KV_dim;
-        uint32_t layer_page = layer * kv_capacity + page_idx;
+        uint32_t lp = layer * kv_capacity + page_idx;
         if (page_idx < kv_capacity) {
-            if (!g->kv_k[layer_page]) {
-                g->kv_k[layer_page] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
-                g->kv_v[layer_page] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
+            if (!g->kv_k[lp]) {
+                g->kv_k[lp] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
+                g->kv_v[lp] = (float *)calloc(page_tokens * KV_dim, sizeof(float));
             }
-            if (g->kv_k[layer_page]) memcpy(g->kv_k[layer_page] + slot_off, k_full, KV_dim * sizeof(float));
-            if (g->kv_v[layer_page]) memcpy(g->kv_v[layer_page] + slot_off, v_full, KV_dim * sizeof(float));
+            if (g->kv_k[lp] && k_full) memcpy(g->kv_k[lp] + slot_off, k_full, KV_dim * sizeof(float));
+            if (g->kv_v[lp] && v_full) memcpy(g->kv_v[lp] + slot_off, v_full, KV_dim * sizeof(float));
         }
     }
 
-    /* Attention: softmax(Q @ K_cache^T / sqrt(HD)) @ V_cache */
-    memset(g->work_att_out, 0, Q_dim * sizeof(float));
+    uint32_t attn_dim = H * HD;
+    if (attn_dim > g->work_att_out_cap) {
+        float *tmp = (float *)realloc(g->work_att_out, (attn_dim + 1) * sizeof(float));
+        if (tmp) { g->work_att_out = tmp; g->work_att_out_cap = attn_dim + 1; }
+    }
+    memset(g->work_att_out, 0, attn_dim * sizeof(float));
     float scale = 1.0f / sqrtf((float)HD);
     uint32_t n_past = pos + 1;
+    uint32_t kv_hdim = HKV ? (KV_dim / HKV) : HD;
 
     for (uint32_t h = 0; h < H; ++h) {
-        uint32_t kv_h = h % HKV;
+        uint32_t gk = H / HKV; gk = gk ? gk : 1;
+        uint32_t kv_h = h / gk;
         float *hq = g->work_qkv + h * HD;
-
         float *scores = (float *)malloc(n_past * sizeof(float));
         if (!scores) continue;
 
         for (uint32_t t = 0; t < n_past; ++t) {
-            uint32_t page_idx = t / page_tokens;
-            uint32_t slot_off = (t % page_tokens) * KV_dim + kv_h * HD;
-            uint32_t layer_page = layer * kv_capacity + page_idx;
-            float *hk = g->kv_k[layer_page] ? (g->kv_k[layer_page] + slot_off) : NULL;
+            uint32_t pi = t / page_tokens;
+            uint32_t so = (t % page_tokens) * KV_dim + kv_h * kv_hdim;
+            uint32_t lpg = layer * kv_capacity + pi;
+            float *hk = (g->kv_k[lpg]) ? (g->kv_k[lpg] + so) : NULL;
             float dot = 0.0f;
             if (hk) { for (uint32_t d = 0; d < HD; ++d) dot += hq[d] * hk[d]; }
             scores[t] = dot * scale;
         }
 
-        /* Softmax */
         float mx = scores[0];
         for (uint32_t t = 1; t < n_past; ++t) if (scores[t] > mx) mx = scores[t];
         float s = 0.0f;
         for (uint32_t t = 0; t < n_past; ++t) { scores[t] = expf(scores[t] - mx); s += scores[t]; }
-        for (uint32_t t = 0; t < n_past; ++t) scores[t] /= s;
+        if (s > 0.0f) for (uint32_t t = 0; t < n_past; ++t) scores[t] /= s;
 
-        /* Weighted sum of V */
         for (uint32_t t = 0; t < n_past; ++t) {
-            uint32_t page_idx = t / page_tokens;
-            uint32_t slot_off = (t % page_tokens) * KV_dim + kv_h * HD;
-            uint32_t layer_page = layer * kv_capacity + page_idx;
-            float *hv = g->kv_v[layer_page] ? (g->kv_v[layer_page] + slot_off) : NULL;
+            uint32_t pi = t / page_tokens;
+            uint32_t so = (t % page_tokens) * KV_dim + kv_h * kv_hdim;
+            uint32_t lpg = layer * kv_capacity + pi;
+            float *hv = (g->kv_v[lpg]) ? (g->kv_v[lpg] + so) : NULL;
             float w = scores[t];
-            if (hv) { for (uint32_t d = 0; d < HD; ++d) g->work_att_out[h * HD + d] += w * hv[d]; }
+            if (hv) { for (uint32_t d = 0; d < kv_hdim; ++d) g->work_att_out[h * kv_hdim + d] += w * hv[d]; }
         }
         free(scores);
     }
 
-    /* Output projection */
     snprintf(name, sizeof(name), "blk.%u.attn_output.weight", layer);
     if (acquire_weight(g, name, &l) == VG_OK) {
-        float *proj_out = (float *)malloc(D * sizeof(float));
-        if (proj_out) {
+        float *po = (float *)malloc(D * sizeof(float));
+        if (po) {
 #ifdef VG_HAS_VULKAN
-            if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_att_out, proj_out, D, Q_dim) == VG_OK) {
-                /* Vulkan dispatch succeeded */
-            } else
+            if (g->vk && vk_matmul(g, l.tensor->ggml_type, l.data, l.size, g->work_att_out, po, D, attn_dim) == VG_OK) { } else
 #endif
-            {
-                vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_att_out, proj_out, D, Q_dim);
-            }
-            for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + proj_out[i];
-            free(proj_out);
+            { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_att_out, po, D, attn_dim); }
+            for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + po[i];
+            free(po);
         }
         release_weight(&l);
+    } else {
+        for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i];
     }
 
     free(k_full); free(v_full);
@@ -631,6 +650,7 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
                 vg_tensor_prefetch_after(g->source, prefetch_name, 4);
             }
         }
+        attention_layer(g, l, g->work_embd, &pos_f);
         ffn_layer(g, l, g->work_embd);
     }
 

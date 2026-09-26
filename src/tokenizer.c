@@ -12,6 +12,7 @@ struct VG_Tokenizer {
     size_t merge_count;
     int32_t bos_id;
     int32_t eos_id;
+    int gpt2_byte_map;
 };
 
 static int32_t find_token(const VG_Tokenizer *tok, const char *text) {
@@ -35,6 +36,22 @@ VG_Status vg_tokenizer_load(const VG_GGUF *file, VG_Tokenizer **out) {
     /* Load vocab from tokenizer.ggml.tokens metadata array text representation.
      * GGUF stores the token list as a metadata array; we parse it from the
      * array-text form that vg_gguf_meta returns for array types. */
+    /* Determine tokenizer model type for decode behavior. */
+    tok->gpt2_byte_map = 0;
+    const char *tok_model = vg_gguf_meta(file, "tokenizer.ggml.model");
+    if (tok_model) {
+        if (!strcmp(tok_model, "gpt2") || !strcmp(tok_model, "bpe")) {
+            tok->gpt2_byte_map = 1;
+        } else if (!strcmp(tok_model, "gemma") || !strcmp(tok_model, "gemma4") ||
+                   !strcmp(tok_model, "llama") || !strcmp(tok_model, "merges") ||
+                   !strcmp(tok_model, "sentencepiece") || !strcmp(tok_model, "sp") ||
+                   !strcmp(tok_model, "bert")) {
+            tok->gpt2_byte_map = 0;
+        }
+    }
+    /* Default to GPT-2 byte map if no model type specified (backward compat). */
+    if (!tok_model) tok->gpt2_byte_map = 1;
+
     const char *tokens_str = vg_gguf_meta(file, "tokenizer.ggml.tokens");
     if (!tokens_str) { free(tok); return VG_E_FORMAT; }
 
@@ -141,6 +158,8 @@ void vg_tokenizer_free(VG_Tokenizer *tok) {
 }
 
 size_t vg_tokenizer_vocab_size(const VG_Tokenizer *tok) { return tok ? tok->vocab_count : 0; }
+int32_t vg_tokenizer_bos_id(const VG_Tokenizer *tok) { return tok ? tok->bos_id : -1; }
+int32_t vg_tokenizer_eos_id(const VG_Tokenizer *tok) { return tok ? tok->eos_id : -1; }
 
 /* GPT-2 word-level tokenizer: split on whitespace/punctuation boundaries, look up in vocab. */
 size_t vg_tokenizer_encode(const VG_Tokenizer *tok, const char *text, int32_t *ids, size_t max_ids) {
@@ -204,11 +223,21 @@ size_t vg_tokenizer_encode(const VG_Tokenizer *tok, const char *text, int32_t *i
     return ntokens;
 }
 
-/* GPT-2 byte-level BPE decode: maps UTF-8 encoded Unicode back to original bytes. */
+/* Decode a token ID to its string piece. Returns length written, or required length if buf is NULL. */
 size_t vg_tokenizer_decode(const VG_Tokenizer *tok, int32_t id, char *buf, size_t buf_len) {
     if (!tok || id < 0 || (size_t)id >= tok->vocab_count) { if (buf && buf_len > 0) buf[0] = 0; return 0; }
     const char *text = tok->vocab[id].text;
+    size_t text_len = strlen(text);
 
+    /* For non-GPT-2 tokenizers (SentencePiece, etc.), token text is already final UTF-8 — copy directly. */
+    if (!tok->gpt2_byte_map) {
+        if (buf && buf_len > 0 && text_len < buf_len) {
+            memcpy(buf, text, text_len + 1);
+        }
+        return text_len;
+    }
+
+    /* GPT-2 byte-level BPE decode: maps UTF-8 encoded Unicode back to original bytes. */
     /* Decode GPT-2 byte-fallback tokens: map UTF-8 encoded Unicode back to bytes.
      * GPT-2 maps byte B to Unicode codepoint 0x100 + rank(B), where rank order is:
      *   0x20(sp),0x21(!)..0x7E(~),0xA1(¡),...,0xFF,0x01,0x02,...0x1F,0x7F,0x80..0xA0

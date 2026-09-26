@@ -1,5 +1,6 @@
 #include "vg/cpu_ops.h"
 #include "vg/gguf.h"
+#include "vg/quant.h"
 
 #include <math.h>
 #include <string.h>
@@ -8,6 +9,8 @@
 /* --- Quantized block structures (matching GGUF ggml format) --- */
 typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;
 typedef struct { uint16_t d; uint8_t qs[32]; } block_q4_0;
+typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; } block_q4_K;
+typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_K;
 
 static float half_to_float(uint16_t h) {
     uint32_t sign = (h >> 15) & 1;
@@ -53,6 +56,81 @@ void vg_cpu_matmul_q4_0(const void *W, const float *x, float *y, uint32_t out_di
     }
 }
 
+/* Q4_K fused matmul: dequantize block-by-block per output row, never the whole weight */
+static uint8_t get_scale_k4(int j, const uint8_t *q) {
+    return j < 4 ? q[j] & 63 : (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+}
+static uint8_t get_min_k4(int j, const uint8_t *q) {
+    return j < 4 ? q[j + 4] & 63 : (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+}
+void vg_cpu_matmul_q4_k(const void *W, const float *x, float *y, uint32_t out_dim, uint32_t in_dim) {
+    const unsigned char *pw = (const unsigned char *)W;
+    uint32_t bs = 256;
+    uint32_t nbs = in_dim / bs;
+    size_t bsize = sizeof(block_q4_K);
+    for (uint32_t row = 0; row < out_dim; ++row) {
+        const block_q4_K *b = (const block_q4_K *)(pw + (uint64_t)row * nbs * bsize);
+        float acc = 0.0f;
+        uint32_t off = 0;
+        for (uint32_t ib = 0; ib < nbs; ++ib) {
+            float d = half_to_float(b[ib].d);
+            float mmin = half_to_float(b[ib].dmin);
+            const uint8_t *sc = b[ib].scales;
+            const uint8_t *qs = b[ib].qs;
+            int is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                float d1 = d * get_scale_k4(is + 0, sc);
+                float m1 = mmin * get_min_k4(is + 0, sc);
+                float d2 = d * get_scale_k4(is + 1, sc);
+                float m2 = mmin * get_min_k4(is + 1, sc);
+                for (int l = 0; l < 32; ++l) {
+                    acc += (d1 * (float)(qs[l] & 0xF) - m1) * x[off + j + l];
+                }
+                for (int l = 0; l < 32; ++l) {
+                    acc += (d2 * (float)(qs[l] >> 4) - m2) * x[off + j + 32 + l];
+                }
+                qs += 32; is += 2;
+            }
+            off += bs;
+        }
+        y[row] = acc;
+    }
+}
+
+/* Q6_K fused matmul */
+void vg_cpu_matmul_q6_k(const void *W, const float *x, float *y, uint32_t out_dim, uint32_t in_dim) {
+    const unsigned char *pw = (const unsigned char *)W;
+    uint32_t bs = 256;
+    uint32_t nbs = in_dim / bs;
+    size_t bsize = sizeof(block_q6_K);
+    for (uint32_t row = 0; row < out_dim; ++row) {
+        const block_q6_K *b = (const block_q6_K *)(pw + (uint64_t)row * nbs * bsize);
+        float acc = 0.0f;
+        for (uint32_t ib = 0; ib < nbs; ++ib) {
+            float d = half_to_float(b[ib].d);
+            const int8_t *sc = b[ib].scales;
+            const uint8_t *ql = b[ib].ql;
+            const uint8_t *qh = b[ib].qh;
+            for (int l = 0; l < 32; ++l) {
+                int is = l / 16;
+                int32_t v1 = (int32_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int32_t v2 = (int32_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int32_t v3 = (int32_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int32_t v4 = (int32_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                float dx1 = d * sc[is + 0];
+                float dx2 = d * sc[is + 2];
+                float dx3 = d * sc[is + 4];
+                float dx4 = d * sc[is + 6];
+                acc += dx1 * v1 * x[ib*bs + l];
+                acc += dx2 * v2 * x[ib*bs + 32 + l];
+                acc += dx3 * v3 * x[ib*bs + 64 + l];
+                acc += dx4 * v4 * x[ib*bs + 96 + l];
+            }
+        }
+        y[row] = acc;
+    }
+}
+
 void vg_cpu_matmul_f32(const void *W, const float *x, float *y, uint32_t out_dim, uint32_t in_dim) {
     const float *wf = (const float *)W;
     for (uint32_t row = 0; row < out_dim; ++row) {
@@ -74,13 +152,28 @@ void vg_cpu_matmul_f16(const void *W, const float *x, float *y, uint32_t out_dim
 }
 
 VG_Status vg_cpu_matmul(uint32_t ggml_type, const void *W, const float *x, float *y,
-                        uint32_t out_dim, uint32_t in_dim) {
+                         uint32_t out_dim, uint32_t in_dim) {
     switch (ggml_type) {
         case 0: vg_cpu_matmul_f32(W, x, y, out_dim, in_dim); return VG_OK;
         case 1: vg_cpu_matmul_f16(W, x, y, out_dim, in_dim); return VG_OK;
         case 8: vg_cpu_matmul_q8_0(W, x, y, out_dim, in_dim); return VG_OK;
         case 2: case 42: vg_cpu_matmul_q4_0(W, x, y, out_dim, in_dim); return VG_OK;
-        default: return VG_E_UNSUPPORTED;
+        case 12: vg_cpu_matmul_q4_k(W, x, y, out_dim, in_dim); return VG_OK;
+        case 14: vg_cpu_matmul_q6_k(W, x, y, out_dim, in_dim); return VG_OK;
+        default: {
+            /* Fallback: dequantize to f32 then matmul. */
+            const VG_QuantInfo *qi = vg_quant_info(ggml_type);
+            if (!qi) return VG_E_UNSUPPORTED;
+            size_t n_el = (size_t)out_dim * in_dim;
+            size_t block_count = n_el / qi->block_size;
+            size_t wbytes = block_count * qi->bytes_per_block;
+            float *deq = (float *)malloc(n_el * sizeof(float));
+            if (!deq) return VG_E_NOMEM;
+            VG_Status st = vg_dequantize_row(ggml_type, W, wbytes, deq, n_el);
+            if (st == VG_OK) { vg_cpu_matmul_f32(deq, x, y, out_dim, in_dim); }
+            free(deq);
+            return st;
+        }
     }
 }
 

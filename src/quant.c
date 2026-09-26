@@ -12,8 +12,16 @@ typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;
 typedef struct { uint16_t d; uint8_t qs[64]; } block_q2_0;
 typedef struct { uint16_t d; uint8_t qs[32]; } block_q3_0;
 typedef struct { uint16_t d; uint8_t qs[64]; } block_q4_0_64;
-typedef struct { uint16_t d; uint8_t qs[64]; } block_q5_0_64;
+typedef struct { uint16_t d; uint8_t qs[128]; } block_q5_0_64;
 typedef struct { uint16_t d; uint8_t qs[128]; } block_q6_0_256;
+
+/* K-quant types (block_size=256) */
+typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[64]; } block_q2_K;
+typedef struct { uint8_t hmask[32]; uint8_t qs[64]; uint8_t scales[12]; uint16_t d; } block_q3_K;
+typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; } block_q4_K;
+typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qh[32]; uint8_t qs[128]; } block_q5_K;
+typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_K;
+typedef struct { float d; int8_t qs[256]; int16_t bsums[16]; } block_q8_K;
 
 static const VG_QuantInfo g_info[] = {
     {VG_QUANT_F32, "F32", 1, 4, 4, 1, 1}, {VG_QUANT_F16, "F16", 1, 2, 2, 1, 1},
@@ -41,14 +49,77 @@ static const VG_QuantInfo g_info[] = {
     {VG_QUANT_MXFP4, "MXFP4", 32, 17, 32, 0, 0},
     {VG_QUANT_NVFP4, "NVFP4", 64, 36, 64, 0, 0},
     {VG_QUANT_Q1_0, "Q1_0", 32, 18, 32, 0, 0},
-    {VG_QUANT_Q2_0, "Q2_0", 32, 18, 32, 0, 0}
+    {VG_QUANT_Q2_0, "Q2_0", 64, 18, 64, 0, 0}
 };
 static const VG_QuantInfo *find(uint32_t type) { for (size_t i = 0; i < sizeof(g_info)/sizeof(g_info[0]); ++i) if ((uint32_t)g_info[i].kind == type) return &g_info[i]; return NULL; }
 const VG_QuantInfo *vg_quant_info(uint32_t type) { return find(type); }
 VG_Status vg_quant_validate(uint32_t type, uint64_t elements, uint64_t bytes) { const VG_QuantInfo *q = find(type); if (!q || !elements || elements % q->block_size || elements / q->block_size > UINT64_MAX / q->bytes_per_block || elements / q->block_size * q->bytes_per_block != bytes) return VG_E_FORMAT; return VG_OK; }
 static float half_to_float(uint16_t h) { uint32_t sign = (uint32_t)(h >> 15) << 31, exp = (h >> 10) & 31u, mant = h & 1023u, bits; if (!exp) bits = mant ? sign | ((uint32_t)(127 - 15 + 1) << 23) | (mant << 13) : sign; else if (exp == 31u) bits = sign | 0x7f800000u | (mant << 13); else bits = sign | ((exp + 112u) << 23) | (mant << 13); float f; memcpy(&f, &bits, sizeof(f)); return f; }
 static float bf16_to_float(uint16_t h) { uint32_t bits = (uint32_t)h << 16; float f; memcpy(&f, &bits, sizeof(f)); return f; }
-static void deq_q4_0(const unsigned char *src, float *y, size_t n) { size_t nb = n / 32; for (size_t b = 0; b < nb; ++b) { const block_q4_0 *q = (const block_q4_0 *)(src + b * 18); float d = half_to_float(q->d); for (size_t j = 0; j < 16; ++j) { y[b*32+j] = ((int)(q->qs[j] & 15u) - 8) * d; y[b*32+16+j] = ((int)(q->qs[j] >> 4) - 8) * d; } } }
+
+/* K-quant helpers (QK_K = 256, K_SCALE_SIZE = 12) */
+#define QK_K 256
+
+static void get_scale_min_k4(int j, const uint8_t *q, uint8_t *d, uint8_t *m) {
+    if (j < 4) { *d = q[j] & 63; *m = q[j + 4] & 63; }
+    else { *d = (q[j+4] & 0xF) | ((q[j-4] >> 6) << 4); *m = (q[j+4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
+static void deq_q4_k(const unsigned char *src, float *y, size_t n) {
+    size_t nb = n / QK_K;
+    for (size_t b = 0; b < nb; ++b) {
+        const block_q4_K *q = (const block_q4_K *)(src + b * 144);
+        const uint8_t *qs = q->qs;
+        float d   = half_to_float(q->d);
+        float min = half_to_float(q->dmin);
+        int is = 0;
+        for (int j = 0; j < QK_K; j += 64) {
+            uint8_t sc, m;
+            get_scale_min_k4(is + 0, q->scales, &sc, &m);
+            float d1 = d * sc; float m1 = min * m;
+            get_scale_min_k4(is + 1, q->scales, &sc, &m);
+            float d2 = d * sc; float m2 = min * m;
+            for (int l = 0; l < 32; ++l) *y++ = d1 * (qs[l] & 0xF) - m1;
+            for (int l = 0; l < 32; ++l) *y++ = d2 * (qs[l] >> 4) - m2;
+            qs += 32; is += 2;
+        }
+    }
+}
+
+static void deq_q6_k(const unsigned char *src, float *y, size_t n) {
+    size_t nb = n / QK_K;
+    for (size_t b = 0; b < nb; ++b) {
+        const block_q6_K *q = (const block_q6_K *)(src + b * 210);
+        float d = half_to_float(q->d);
+        const uint8_t *ql = q->ql;
+        const uint8_t *qh = q->qh;
+        const int8_t *sc = q->scales;
+        for (int n_off = 0; n_off < QK_K; n_off += 128) {
+            for (int l = 0; l < 32; ++l) {
+                int is = l/16;
+                int8_t q1 = (int8_t)((ql[l + 0] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+                int8_t q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+                int8_t q3 = (int8_t)((ql[l + 0] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+                int8_t q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+                y[l + 0] = d * sc[is + 0] * q1;
+                y[l + 32] = d * sc[is + 2] * q2;
+                y[l + 64] = d * sc[is + 4] * q3;
+                y[l + 96] = d * sc[is + 6] * q4;
+            }
+            y += 128; ql += 64; qh += 32; sc += 8;
+        }
+    }
+}
+
+static void deq_q8_k(const unsigned char *src, float *y, size_t n) {
+    size_t nb = n / QK_K;
+    for (size_t b = 0; b < nb; ++b) {
+        const block_q8_K *q = (const block_q8_K *)(src + b * (4 + QK_K + QK_K/16*2));
+        for (int j = 0; j < QK_K; ++j) *y++ = q->d * q->qs[j];
+    }
+}
+
+void deq_q4_0(const unsigned char *src, float *y, size_t n) { size_t nb = n / 32; for (size_t b = 0; b < nb; ++b) { const block_q4_0 *q = (const block_q4_0 *)(src + b * 18); float d = half_to_float(q->d); for (size_t j = 0; j < 16; ++j) { y[b*32+j] = ((int)(q->qs[j] & 15u) - 8) * d; y[b*32+16+j] = ((int)(q->qs[j] >> 4) - 8) * d; } } }
 static void deq_q4_1(const unsigned char *src, float *y, size_t n) { size_t nb = n / 32; for (size_t b = 0; b < nb; ++b) { const block_q4_1 *q = (const block_q4_1 *)(src + b * 20); float d = half_to_float(q->d), m = half_to_float(q->m); for (size_t j = 0; j < 16; ++j) { y[b*32+j] = (q->qs[j] & 15u) * d + m; y[b*32+16+j] = (q->qs[j] >> 4) * d + m; } } }
 static void deq_q5_0(const unsigned char *src, float *y, size_t n) { size_t nb = n / 32; for (size_t b = 0; b < nb; ++b) { const block_q5_0 *q = (const block_q5_0 *)(src + b * 22); uint32_t qh; memcpy(&qh, q->qh, 4); float d = half_to_float(q->d); for (size_t j = 0; j < 16; ++j) { int x0 = ((q->qs[j] & 15u) | (((qh >> j) & 1u) << 4)) - 16; int x1 = ((q->qs[j] >> 4) | (((qh >> (j + 12)) & 1u) << 4)) - 16; y[b*32+j] = x0*d; y[b*32+16+j] = x1*d; } } }
 static void deq_q5_1(const unsigned char *src, float *y, size_t n) { size_t nb = n / 32; for (size_t b = 0; b < nb; ++b) { const block_q5_1 *q = (const block_q5_1 *)(src + b * 24); uint32_t qh; memcpy(&qh, q->qh, 4); float d = half_to_float(q->d), m = half_to_float(q->m); for (size_t j = 0; j < 16; ++j) { int x0 = (q->qs[j] & 15u) | (((qh >> j) & 1u) << 4); int x1 = (q->qs[j] >> 4) | (((qh >> (j + 12)) & 1u) << 4); y[b*32+j] = x0*d + m; y[b*32+16+j] = x1*d + m; } } }
@@ -62,7 +133,7 @@ VG_Status vg_dequantize_row(uint32_t type, const void *packed, size_t bytes, flo
     if (type == VG_QUANT_I16) { const int16_t *p = (const int16_t *)packed; for (size_t i = 0; i < elements; ++i) out[i] = (float)p[i]; return VG_OK; }
     if (type == VG_QUANT_I32) { const int32_t *p = (const int32_t *)packed; for (size_t i = 0; i < elements; ++i) out[i] = (float)p[i]; return VG_OK; }
     if (type == VG_QUANT_I64) { const int64_t *p = (const int64_t *)packed; for (size_t i = 0; i < elements; ++i) out[i] = (float)p[i]; return VG_OK; }
-    if (type == VG_QUANT_Q4_0) deq_q4_0((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q4_1) deq_q4_1((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q5_0) deq_q5_0((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q5_1) deq_q5_1((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q8_0) deq_q8_0((const unsigned char *)packed, out, elements); else return VG_E_UNSUPPORTED;
+    if (type == VG_QUANT_Q4_0) deq_q4_0((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q4_1) deq_q4_1((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q5_0) deq_q5_0((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q5_1) deq_q5_1((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q8_0) deq_q8_0((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q4_K) deq_q4_k((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q6_K) deq_q6_k((const unsigned char *)packed, out, elements); else if (type == VG_QUANT_Q8_K) deq_q8_k((const unsigned char *)packed, out, elements); else return VG_E_UNSUPPORTED;
     return VG_OK;
 }
 VG_Status vg_quantized_dot(uint32_t type, const void *packed, size_t bytes, const float *x, size_t elements, float *out) {
