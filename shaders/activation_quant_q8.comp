@@ -1,0 +1,39 @@
+#version 450
+// Activation -> Q8_0 quantizer (device-side), the GPU twin of
+// quantize_row_q8_0_host(): one workgroup invocation per 32-element block.
+// Produces the split layout the dp4a matvec kernel consumes:
+//   D[b]  = per-block scale (fp32)
+//   Q[b*8..b*8+7] = 32 int8 values packed 4-per-uint32
+layout(local_size_x = 1) in;
+
+layout(std430, binding = 0) readonly  buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer D { float xd[]; };
+layout(std430, binding = 2) writeonly buffer Q { uint  xq[]; };
+
+layout(push_constant) uniform PC { uint nblocks; } pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b >= pc.nblocks) return;
+
+    uint base = b * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; ++i) {
+        float a = abs(x[base + i]);
+        if (a > amax) amax = a;
+    }
+    float d = amax / 127.0;
+    float id = d > 0.0 ? 1.0 / d : 0.0;
+    xd[b] = d;
+
+    uint qbase = b * 8u;
+    for (uint g = 0u; g < 8u; ++g) {
+        uint w = 0u;
+        for (uint j = 0u; j < 4u; ++j) {
+            int q = int(round(x[base + g * 4u + j] * id));
+            q = clamp(q, -128, 127);
+            w |= (uint(q) & 0xFFu) << (j * 8u);
+        }
+        xq[qbase + g] = w;
+    }
+}

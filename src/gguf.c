@@ -56,6 +56,13 @@ static int seek64(FILE *f, uint64_t off) {
     return fseeko(f, (off_t)off, SEEK_SET) == 0;
 #endif
 }
+static int seek_end64(FILE *f) {
+#ifdef _WIN32
+    return _fseeki64(f, 0, SEEK_END) == 0;
+#else
+    return fseeko(f, 0, SEEK_END) == 0;
+#endif
+}
 static uint64_t tell64(FILE *f) {
 #ifdef _WIN32
     return (uint64_t)_ftelli64(f);
@@ -134,29 +141,35 @@ static char *read_array_text(FILE *f) {
     uint32_t type; uint64_t n; size_t cap = 64u, len = 0;
     if (!u32(f, &type) || !u64(f, &n) || n > (1ull << 20)) return NULL;
     char *out = (char *)malloc(cap); if (!out) return NULL; out[0] = '[';
+    len = 1;
     for (uint64_t i = 0; i < n; ++i) {
         char *item = read_scalar_value(f, type); if (!item) { free(out); return NULL; }
         size_t ilen = strlen(item);
-        /* For string arrays, wrap each element in quotes to match JSON array format */
         int quoted = (type == 8);
-        size_t extra = ilen + (i ? 1u : 0u) + 2u + (quoted ? 2u : 0u);
-        if (len + extra >= cap) { while (len + extra >= cap) { if (cap > SIZE_MAX / 2u) { free(item); free(out); return NULL; } cap *= 2u; } char *grown = (char *)realloc(out, cap); if (!grown) { free(item); free(out); return NULL; } out = grown; }
-        if (i) out[++len] = ',';
+        size_t need = len + (i ? 1u : 0u) + (quoted ? 2u : 0u) + ilen + 1u;
+        while (need >= cap) {
+            if (cap > SIZE_MAX / 2u) { free(item); free(out); return NULL; }
+            cap *= 2u;
+            char *grown = (char *)realloc(out, cap);
+            if (!grown) { free(item); free(out); return NULL; }
+            out = grown;
+        }
+        if (i) out[len++] = ',';
         if (quoted) {
-            out[++len] = '"';
-            /* Escape double quotes and backslashes in string elements */
+            out[len++] = '"';
             for (size_t j = 0; j < ilen; ++j) {
-                if (item[j] == '"' || item[j] == '\\') {
-                    if (len + 3 >= cap) { while (len + 3 >= cap) { if (cap > SIZE_MAX / 2u) break; cap *= 2u; } char *grown = (char *)realloc(out, cap); if (!grown) { free(item); free(out); return NULL; } out = grown; }
-                    out[++len] = '\\';
-                }
-                out[++len] = item[j];
+                char c = item[j];
+                if (c == '"' || c == '\\') out[len++] = '\\';
+                out[len++] = c;
             }
-            out[++len] = '"';
-        } else { memcpy(out + len + 1u, item, ilen); len += 1u + ilen; }
+            out[len++] = '"';
+        } else {
+            memcpy(out + len, item, ilen);
+            len += ilen;
+        }
         free(item);
     }
-    out[len + 1u] = ']'; out[len + 2u] = 0; return out;
+    out[len] = ']'; out[len + 1u] = 0; return out;
 }
 static int skip_value(FILE *f, uint32_t type) {
     uint8_t b[8];
@@ -277,7 +290,7 @@ static VG_Status parse_index(VG_GGUF *g) {
 VG_Status vg_gguf_open(const char *path, VG_GGUF **out) {
     if (!path || !out) return VG_E_INVALID; *out = NULL;
     FILE *f = fopen(path, "rb"); if (!f) return VG_E_IO;
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return VG_E_IO; }
+    if (!seek_end64(f)) { fclose(f); return VG_E_IO; }
     uint64_t size = tell64(f); if (size < 24 || !seek64(f, 0)) { fclose(f); return VG_E_FORMAT; }
     VG_GGUF *g = (VG_GGUF *)calloc(1, sizeof(*g)); if (!g) { fclose(f); return VG_E_NOMEM; }
     g->path = _strdup(path); g->index = f; g->file_size = size;

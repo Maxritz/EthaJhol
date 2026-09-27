@@ -1,0 +1,71 @@
+#version 450
+// Single-token attention for one query head over all cached keys.
+// KV cache layout is POSITION-MAJOR: row j holds the KV_dim vector for token j
+// (all kv heads contiguous), so the stride between positions is kv_stride floats
+// and the kv head occupies kvh*head_dim within a row.
+//   scores[j] = dot(Q_h, K_kvh[j]) * (1/sqrt(head_dim))
+//   p = softmax(scores[0..n_keys))
+//   O_h = sum_j p[j] * V_kvh[j]
+// One workgroup per query head (dispatch n_head). GQA-aware: query head h maps to
+// KV head h / (n_head / n_kv_head). Scores capped at 4096 keys.
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly  buffer Q { float q[]; };
+layout(std430, binding = 1) readonly  buffer K { float k[]; };
+layout(std430, binding = 2) readonly  buffer V { float v[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+
+layout(push_constant) uniform P {
+    uint head_dim;
+    uint n_head;
+    uint n_kv_head;
+    uint kv_stride;  // floats between consecutive positions (= KV_dim)
+    uint n_keys;     // keys valid for this token (= pos+1)
+} pc;
+
+shared float sc[4096];
+shared float red[128];
+
+void main() {
+    uint h   = gl_WorkGroupID.x;
+    uint lid = gl_LocalInvocationID.x;
+    if (h >= pc.n_head) return;
+
+    uint hd     = pc.head_dim;
+    uint groups = (pc.n_kv_head != 0u) ? (pc.n_head / pc.n_kv_head) : 1u;
+    uint kvh    = h / ((groups != 0u) ? groups : 1u);
+    uint nk     = min(pc.n_keys, 4096u);
+
+    uint qbase = h * hd;
+    uint kbase = kvh * hd;
+    float scale = 1.0 / sqrt(float(hd));
+
+    // 1) scores + local max
+    float mx = -1e30;
+    for (uint j = lid; j < nk; j += 128u) {
+        uint rbase = j * pc.kv_stride + kbase;
+        float dot = 0.0;
+        for (uint d = 0; d < hd; ++d) dot += q[qbase + d] * k[rbase + d];
+        dot *= scale;
+        sc[j] = dot;
+        if (dot > mx) mx = dot;
+    }
+    // 2) block max reduce
+    red[lid] = mx; barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (lid < s) red[lid] = max(red[lid], red[lid + s]); barrier(); }
+    mx = red[0]; barrier();
+
+    // 3) exp + sum reduce
+    float part = 0.0;
+    for (uint j = lid; j < nk; j += 128u) { float e = exp(sc[j] - mx); sc[j] = e; part += e; }
+    red[lid] = part; barrier();
+    for (uint s = 64u; s > 0u; s >>= 1u) { if (lid < s) red[lid] += red[lid + s]; barrier(); }
+    float inv = (red[0] > 0.0) ? (1.0 / red[0]) : 0.0; barrier();
+
+    // 4) O_h = sum_j p_j * V_j
+    for (uint d = lid; d < hd; d += 128u) {
+        float acc = 0.0;
+        for (uint j = 0; j < nk; ++j) acc += sc[j] * v[j * pc.kv_stride + kbase + d];
+        o[qbase + d] = acc * inv;
+    }
+}

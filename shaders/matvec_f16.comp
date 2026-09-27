@@ -12,7 +12,16 @@ float decode_f16(uint h) {
     uint exp = (h >> 10u) & 0x1fu;
     uint mantissa = h & 0x3ffu;
     uint f;
-    if (exp == 0u) { f = (sign << 31u) | (mantissa != 0u ? ((mantissa << 13u) + ((127u - 14u) << 23u)) : 0u); }
+    if (exp == 0u) {
+        if (mantissa == 0u) { f = sign << 31u; }
+        else {
+            int e = -1;
+            uint m = mantissa;
+            do { m <<= 1u; ++e; } while ((m & 0x400u) == 0u);
+            m &= 0x3ffu;
+            f = (sign << 31u) | (uint(127 - 15 - e) << 23u) | (m << 13u);
+        }
+    }
     else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
     else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
     return uintBitsToFloat(f);

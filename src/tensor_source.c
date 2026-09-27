@@ -190,6 +190,20 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
     if (!s || !name || !out) return VG_E_INVALID; memset(out, 0, sizeof(*out));
     uint64_t t0 = vg_trace_now_ns();
     const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, name); if (!t) return VG_E_INVALID;
+    /* A storage lease returns a pointer into the mapped file. Virtual mapping is lazy and does not
+     * make the whole model resident. It is the preferred path for fused streaming kernels.
+     * Checked BEFORE the RAM cache so large tensors (e.g. MoE experts) never malloc/thrash the
+     * host budget: zero-copy, no eviction, no repeated disk reads. */
+    if (desired == VG_TIER_STORAGE && s->cfg.use_mmap) {
+        const void *mbase; uint64_t msize;
+        lock_src(s); ++s->stats.lookups;
+        VG_Status mst = vg_gguf_map(s->file, &mbase, &msize);
+        if (mst == VG_OK && t->data_offset <= msize - vg_gguf_data_base(s->file)) {
+            ++s->stats.hits; out->tensor = t; out->data = (const unsigned char *)mbase + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0;
+            unlock_src(s); vg_trace_emit("tensor_acquire_storage", t0, vg_trace_now_ns(), t->nbytes, 0); return VG_OK;
+        }
+        unlock_src(s);
+    }
     lock_src(s); ++s->stats.lookups; VG_CacheEntry *e = find_entry(s, t, desired);
     if (e) { ++e->refs; e->age = ++s->clock; ++s->stats.hits; out->tensor = t; out->data = e->data; out->size = e->bytes; out->tier = e->tier; out->ticket = (uint64_t)(e - s->entries + 1); out->source = s; unlock_src(s); vg_trace_emit("tensor_acquire_hit", t0, vg_trace_now_ns(), e->bytes, 0); return VG_OK; }
     ++s->stats.misses;
@@ -280,7 +294,7 @@ VG_Status vg_tensor_prefetch_after(VG_TensorSource *s, const char *name, unsigne
         if (vg_gguf_tensor_at(s->file, fi) == t) {
             for (unsigned p = 1; p <= depth && fi + p < tc; ++p) {
                 const VG_GGUF_Tensor *next = vg_gguf_tensor_at(s->file, fi + p);
-                if (next) { VG_TensorLease pl; if (vg_tensor_acquire(s, next->name, VG_TIER_HOST, &pl) == VG_OK) { vg_tensor_release(&pl); ++s->stats.prefetch_hits; } }
+                if (next && next->nbytes <= 8u * 1024u * 1024u) { VG_TensorLease pl; if (vg_tensor_acquire(s, next->name, VG_TIER_HOST, &pl) == VG_OK) { vg_tensor_release(&pl); ++s->stats.prefetch_hits; } }
             }
             return VG_OK;
         }

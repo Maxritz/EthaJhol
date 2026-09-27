@@ -54,7 +54,7 @@ static const VG_QuantInfo g_info[] = {
 static const VG_QuantInfo *find(uint32_t type) { for (size_t i = 0; i < sizeof(g_info)/sizeof(g_info[0]); ++i) if ((uint32_t)g_info[i].kind == type) return &g_info[i]; return NULL; }
 const VG_QuantInfo *vg_quant_info(uint32_t type) { return find(type); }
 VG_Status vg_quant_validate(uint32_t type, uint64_t elements, uint64_t bytes) { const VG_QuantInfo *q = find(type); if (!q || !elements || elements % q->block_size || elements / q->block_size > UINT64_MAX / q->bytes_per_block || elements / q->block_size * q->bytes_per_block != bytes) return VG_E_FORMAT; return VG_OK; }
-static float half_to_float(uint16_t h) { uint32_t sign = (uint32_t)(h >> 15) << 31, exp = (h >> 10) & 31u, mant = h & 1023u, bits; if (!exp) bits = mant ? sign | ((uint32_t)(127 - 15 + 1) << 23) | (mant << 13) : sign; else if (exp == 31u) bits = sign | 0x7f800000u | (mant << 13); else bits = sign | ((exp + 112u) << 23) | (mant << 13); float f; memcpy(&f, &bits, sizeof(f)); return f; }
+static float half_to_float(uint16_t h) { uint32_t sign = (uint32_t)(h >> 15) << 31, exp = (h >> 10) & 31u, mant = h & 1023u, bits; if (!exp) { if (!mant) { bits = sign; } else { int e2 = -1; uint32_t m2 = mant; do { m2 <<= 1; ++e2; } while (!(m2 & 0x400u)); m2 &= 0x3ffu; bits = sign | ((uint32_t)(127 - 15 - e2) << 23) | (m2 << 13); } } else if (exp == 31u) bits = sign | 0x7f800000u | (mant << 13); else bits = sign | ((exp + 112u) << 23) | (mant << 13); float f; memcpy(&f, &bits, sizeof(f)); return f; }
 static float bf16_to_float(uint16_t h) { uint32_t bits = (uint32_t)h << 16; float f; memcpy(&f, &bits, sizeof(f)); return f; }
 
 /* K-quant helpers (QK_K = 256, K_SCALE_SIZE = 12) */

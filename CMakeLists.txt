@@ -38,6 +38,10 @@ if(VG_ENABLE_VULKAN)
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_f32.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q4_0.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q8_0.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/activation_quant_q8.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/attn_scores.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/resid_add.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_adj.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/softmax.comp
@@ -48,7 +52,7 @@ if(VG_ENABLE_VULKAN)
       get_filename_component(SHADER_NAME ${SHADER} NAME)
       add_custom_command(
         OUTPUT ${SPIRV_DIR}/${SHADER_NAME}.spv
-        COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER} -o ${SPIRV_DIR}/${SHADER_NAME}.spv
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1 ${SHADER} -o ${SPIRV_DIR}/${SHADER_NAME}.spv
         DEPENDS ${SHADER}
         VERBATIM)
       list(APPEND VG_SHADER_OUTPUTS ${SPIRV_DIR}/${SHADER_NAME}.spv)
@@ -129,6 +133,17 @@ else()
   target_link_libraries(vg-tensor-tests PRIVATE vg_core)
 endif()
 add_test(NAME vg-tensor COMMAND vg-tensor-tests)
+
+add_executable(vg-tokenizer-tests tests/test_tokenizer.c)
+target_include_directories(vg-tokenizer-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vg-tokenizer-tests PRIVATE vg_core)
+add_test(NAME vg-tokenizer COMMAND vg-tokenizer-tests)
+
+add_executable(vg-sampler-tests tests/test_sampler.c)
+target_include_directories(vg-sampler-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vg-sampler-tests PRIVATE vg_full vg_core)
+add_test(NAME vg-sampler COMMAND vg-sampler-tests)
+
 if(TARGET vg-run AND EXISTS "${CMAKE_SOURCE_DIR}/testdata/stories15M-q4_0.gguf")
   add_test(NAME vg-full-smoke COMMAND vg-run -m "${CMAKE_SOURCE_DIR}/testdata/stories15M-q4_0.gguf" -p "Once upon a time" -n 8 -c 128 --temp 0.0)
   message(STATUS "Smoke test registered (testdata/stories15M-q4_0.gguf found)")

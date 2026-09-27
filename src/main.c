@@ -28,6 +28,9 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
         int32_t best = 0; for (uint32_t i = 1; i < n_vocab; ++i) if (logits[i] > logits[best]) best = (int32_t)i;
         return best;
     }
+#ifdef VG_BUILD_FULL_ENGINE
+    vg_apply_repetition_penalty(logits, n_vocab, hist, (size_t)hist_len, repeat_penalty);
+#else
     if (repeat_penalty != 1.0f && hist) {
         for (int32_t i = 0; i < hist_len; ++i) {
             int32_t t = hist[i];
@@ -35,6 +38,7 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
             else if (t >= 0 && (uint32_t)t < n_vocab && logits[t] < 0.0f) logits[t] *= repeat_penalty;
         }
     }
+#endif
     for (uint32_t i = 0; i < n_vocab; ++i) logits[i] /= temperature;
     /* Softmax */
     float mx = logits[0]; for (uint32_t i = 1; i < n_vocab; ++i) if (logits[i] > mx) mx = logits[i];

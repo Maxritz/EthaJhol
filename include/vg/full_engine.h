@@ -27,6 +27,17 @@ typedef struct VG_GenerateConfig {
 
 typedef int (*VG_TokenCallback)(const char *piece, size_t bytes, int32_t token_id, void *user);
 
+/* Subtract `penalty` from the logit of every token that appears in `history`,
+ * to discourage repetition. Uses the additive form (logit -= penalty per
+ * occurrence); tokens absent from history are untouched. This is the llama.cpp
+ * "additive" repeat-penalty variant and is numerically safe because it only
+ * shifts already-computed logits, so softmax ordering is preserved up to the
+ * penalized mass. Idempotent w.r.t. the same history (applying it twice on an
+ * unchanged history is NOT intended). Pure function: safe to unit-test. */
+void vg_apply_repetition_penalty(float *logits, uint32_t n_vocab,
+                                 const int32_t *history, size_t hist_len,
+                                 float penalty);
+
 /* Native CPU inference engine. Loads a GGUF model, evaluates the transformer
  * graph, samples the next token, and streams pieces back through the callback. */
 VG_Status vg_generate(const char *model_path, const char *prompt,

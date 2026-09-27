@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "gguf.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -18,7 +19,6 @@ void vg_cpu_matmul_f32(const void *W, const float *x, float *y, uint32_t out_dim
 void vg_cpu_matmul_f16(const void *W, const float *x, float *y, uint32_t out_dim, uint32_t in_dim);
 
 /* Generic quantized matmul dispatching on ggml_type. Returns VG_E_UNSUPPORTED for unknown types. */
-typedef enum VG_Status VG_Status;
 VG_Status vg_cpu_matmul(uint32_t ggml_type, const void *W, const float *x, float *y,
                         uint32_t out_dim, uint32_t in_dim);
 

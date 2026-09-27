@@ -1,0 +1,38 @@
+#version 450
+// RoPE for one token, ggml GGML_ROPE_TYPE_NORMAL (LLAMA): rotate ADJACENT pairs
+// (2k, 2k+1). freq = pos * base^(-2i/n_rot) / rope_freqs[i]. This matches the
+// engine's verified CPU rope (vg_cpu_rope) exactly, unlike the NEOX-style
+// rope.comp. One invocation per rotary pair across all heads in the buffer.
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer QK { float qk[]; };
+layout(std430, binding = 1) readonly buffer Freq { float rf[]; };
+layout(push_constant) uniform P {
+    uint  head_dim;   // elements per head
+    uint  n_rot;      // rotary dims
+    uint  n_head;     // heads in this buffer
+    uint  pos;        // sequence position
+    float theta_base;
+    uint  has_freqs;  // 1 => divide by rf[i]
+} p;
+
+void main() {
+    uint n_pairs = p.n_rot / 2u;
+    uint total = n_pairs * p.n_head;
+    uint linear = gl_GlobalInvocationID.x;
+    if (linear >= total) return;
+
+    uint i = linear % n_pairs;
+    uint h = linear / n_pairs;
+    uint base = h * p.head_dim;
+
+    float inv = pow(p.theta_base, -2.0 * float(i) / float(p.n_rot));
+    float freq = float(p.pos) * inv;
+    if (p.has_freqs != 0u) freq /= rf[i];
+    float c = cos(freq), s = sin(freq);
+
+    uint a_idx = base + 2u * i;
+    uint b_idx = base + 2u * i + 1u;
+    float a = qk[a_idx], b = qk[b_idx];
+    qk[a_idx] = a * c - b * s;
+    qk[b_idx] = a * s + b * c;
+}

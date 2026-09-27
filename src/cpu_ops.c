@@ -8,18 +8,41 @@
 
 /* --- Quantized block structures (matching GGUF ggml format) --- */
 typedef struct { uint16_t d; int8_t qs[32]; } block_q8_0;
-typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0; /* Q4_0: fp16 d + 16B packed nibbles = 18B/block (must match VG_QUANT_Q4_0 bytes_per_block=18 in quant.c) */
+typedef struct { uint16_t d; uint8_t qs[16]; } block_q4_0; /* Q4_0: fp16 d + 16B packed nibbles = 18B/block */
 typedef struct { uint16_t d; uint16_t dmin; uint8_t scales[12]; uint8_t qs[128]; } block_q4_K;
 typedef struct { uint8_t ql[128]; uint8_t qh[64]; int8_t scales[16]; uint16_t d; } block_q6_K;
 
+/* Compile-time guard: struct sizes must match quant.h metadata */
+#define VG_STATIC_ASSERT(cond) typedef char vg_static_assert_##__LINE__[(cond) ? 1 : -1]
+VG_STATIC_ASSERT(sizeof(block_q4_0) == VG_QUANT_BYTES_PER_BLOCK_Q4_0);
+VG_STATIC_ASSERT(sizeof(block_q8_0) == VG_QUANT_BYTES_PER_BLOCK_Q8_0);
+VG_STATIC_ASSERT(sizeof(block_q4_K) == VG_QUANT_BYTES_PER_BLOCK_Q4_K);
+VG_STATIC_ASSERT(sizeof(block_q6_K) == VG_QUANT_BYTES_PER_BLOCK_Q6_K);
+
 static float half_to_float(uint16_t h) {
-    uint32_t sign = (h >> 15) & 1;
-    uint32_t exp = (h >> 10) & 0x1f;
-    uint32_t mantissa = h & 0x3ff;
+    uint32_t sign = (uint32_t)(h >> 15) << 31;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mantissa = h & 0x3ffu;
     uint32_t f;
-    if (exp == 0) { f = (sign << 31) | (mantissa ? ((mantissa << 13) + (127u - 14u) * (1u << 23)) : 0); }
-    else if (exp == 31) { f = (sign << 31) | 0x7f800000u | (mantissa << 13); }
-    else { f = (sign << 31) | ((exp + 127u - 15u) << 23) | (mantissa << 13); }
+    if (exp == 0) {
+        if (mantissa == 0) {
+            f = sign;                       /* +/- zero */
+        } else {
+            /* Subnormal half: value = mantissa * 2^-24. Normalize so the
+             * implicit leading 1 lands at bit 10, then rebias to float32.
+             * (The old shortcut produced scales up to ~1000x too large,
+             * which distorted every Q8_0 matmul by a few percent.) */
+            int e = -1;
+            uint32_t m = mantissa;
+            do { m <<= 1; ++e; } while (!(m & 0x400u));
+            m &= 0x3ffu;
+            f = sign | ((uint32_t)(127 - 15 - e) << 23) | (m << 13);
+        }
+    } else if (exp == 31u) {
+        f = sign | 0x7f800000u | (mantissa << 13);
+    } else {
+        f = sign | ((exp + 127u - 15u) << 23) | (mantissa << 13);
+    }
     float v; memcpy(&v, &f, 4); return v;
 }
 
@@ -186,18 +209,22 @@ void vg_cpu_rmsnorm(float *out, const float *x, const float *weight, uint32_t di
 
 void vg_cpu_rope(float *q, float *k, uint32_t head_dim, uint32_t n_rot,
                  float freq_scale, float theta_base, int32_t pos) {
-    uint32_t half = head_dim / 2;
-    uint32_t iters = n_rot ? (n_rot < half ? n_rot : half) : half;
+    /* ggml GGML_ROPE_TYPE_NORMAL (used by LLAMA arch): rotate ADJACENT pairs
+     * (2k, 2k+1) with theta_k = pos * base^(-2k/head_dim). The previous
+     * rotate-half pairing (k, k+half) is the NEOX convention and produced
+     * subtly wrong attention for every position > 0. */
+    uint32_t pairs = head_dim / 2;
+    uint32_t iters = n_rot ? ((n_rot / 2) < pairs ? (n_rot / 2) : pairs) : pairs;
     for (uint32_t i = 0; i < iters; ++i) {
         float freq = pos * freq_scale / powf(theta_base, (float)(2 * i) / (float)head_dim);
         float cosf_val = cosf(freq), sinf_val = sinf(freq);
-        float q0 = q[i], q1 = q[i + half];
-        q[i] = q0 * cosf_val - q1 * sinf_val;
-        q[i + half] = q0 * sinf_val + q1 * cosf_val;
+        float q0 = q[2 * i], q1 = q[2 * i + 1];
+        q[2 * i] = q0 * cosf_val - q1 * sinf_val;
+        q[2 * i + 1] = q0 * sinf_val + q1 * cosf_val;
         if (q != k) {
-            float k0 = k[i], k1 = k[i + half];
-            k[i] = k0 * cosf_val - k1 * sinf_val;
-            k[i + half] = k0 * sinf_val + k1 * cosf_val;
+            float k0 = k[2 * i], k1 = k[2 * i + 1];
+            k[2 * i] = k0 * cosf_val - k1 * sinf_val;
+            k[2 * i + 1] = k0 * sinf_val + k1 * cosf_val;
         }
     }
 }
