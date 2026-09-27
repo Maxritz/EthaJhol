@@ -137,29 +137,22 @@ static VG_Status make_buffer(VG_VK *v, size_t bytes, VkBufferUsageFlags usage, V
     return make_buffer_ex(v, bytes, usage, 0, out);
 }
 /* Copy host data into a (possibly device-local) buffer via a staging buffer. */
+static VG_Status submit_one(VG_VK *v, const std::function<void(VkCommandBuffer)> &record);
 static VG_Status upload_buffer(VG_VK *v, VG_VKBuffer *dst, const void *data, size_t bytes) {
     if (dst->mapped) { std::memcpy(dst->mapped, data, bytes); if (!dst->coherent) { VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE}; r.memory = dst->memory; r.size = VK_WHOLE_SIZE; vkFlushMappedMemoryRanges(v->device, 1, &r); } return VG_OK; }
+    /* Persistent host-visible staging reused across uploads (COMPASS 2.6). The
+     * old path allocated a staging buffer + command buffer and drained the whole
+     * queue with vkQueueWaitIdle for EVERY expert miss, which dominated MoE
+     * decode. Reuse the scratch buffer and the shared CB/fence instead. */
     VG_VKBuffer *staging = nullptr;
-    VG_Status s = make_buffer(v, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, &staging);
+    VG_Status s = vg_vk_scratch_acquire(v, 900u, bytes, &staging);
     if (s != VG_OK) return s;
     std::memcpy(staging->mapped, data, bytes);
     if (!staging->coherent) { VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE}; r.memory = staging->memory; r.size = VK_WHOLE_SIZE; vkFlushMappedMemoryRanges(v->device, 1, &r); }
-    bool ok = false;
-    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO}; ai.commandPool = v->command_pool; ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY; ai.commandBufferCount = 1; VkCommandBuffer cb{};
-    if (vkAllocateCommandBuffers(v->device, &ai, &cb) == VK_SUCCESS) {
-        VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO}; bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-        if (vkBeginCommandBuffer(cb, &bi) == VK_SUCCESS) {
-            VkBufferCopy region{}; region.size = bytes;
-            vkCmdCopyBuffer(cb, staging->buffer, dst->buffer, 1, &region);
-            if (vkEndCommandBuffer(cb) == VK_SUCCESS) {
-                VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO}; si.commandBufferCount = 1; si.pCommandBuffers = &cb;
-                if (vkQueueSubmit(v->queue, 1, &si, VK_NULL_HANDLE) == VK_SUCCESS && vkQueueWaitIdle(v->queue) == VK_SUCCESS) ok = true;
-            }
-        }
-        vkFreeCommandBuffers(v->device, v->command_pool, 1, &cb);
-    }
-    destroy_buffer(v, staging);
-    return ok ? VG_OK : VG_E_IO;
+    return submit_one(v, [&](VkCommandBuffer cb) {
+        VkBufferCopy region{}; region.size = bytes;
+        vkCmdCopyBuffer(cb, staging->buffer, dst->buffer, 1, &region);
+    });
 }
 static VG_Status submit_one(VG_VK *v, const std::function<void(VkCommandBuffer)> &record) {
     VkCommandBuffer cb = v->cb_reuse;
@@ -192,8 +185,17 @@ VG_Status vg_vk_cache_acquire(VG_VK *v, const void *key, uint32_t tag, const voi
     /* LRU with the in-flight entry (newest stamp) never evicted, so an in-flight
      * matvec's weight buffer cannot be freed underneath it. The budget is
      * env-overridable (VG_VK_CACHE_MB / VG_VK_CACHE_PCT) so large MoE hot sets
-     * can be kept resident on machines with VRAM to spare. */
+     * can be kept resident on machines with VRAM to spare. Clamp the effective
+     * limit to the TRUE remaining device memory (minus a headroom) so a large
+     * MoE working set evicts an old expert instead of hitting VG_E_NOMEM in
+     * make_buffer_ex and silently dropping the whole expert to the CPU path. */
     uint64_t soft = v->cache_budget ? v->cache_budget : (v->memory_budget_bytes * 85u / 100u);
+    {
+        uint64_t noncache = (v->memory_allocated > v->cache_total) ? (v->memory_allocated - v->cache_total) : 0;
+        const uint64_t headroom = 192ull * 1024ull * 1024ull;
+        uint64_t room = (v->memory_budget_bytes > noncache + headroom) ? (v->memory_budget_bytes - noncache - headroom) : 0;
+        if (soft > room) soft = room;
+    }
     while (!v->cache.empty() && v->cache_total + bytes > soft) {
         size_t victim = (size_t)-1; uint64_t oldest = ~0ull;
         for (size_t i = 0; i < v->cache.size(); ++i) {
@@ -240,7 +242,7 @@ VG_Status vg_vk_scratch_acquire(VG_VK *v, uint32_t slot, size_t bytes, VG_VKBuff
     if (v->scratch[slot].second && v->scratch[slot].first >= bytes) { *out = v->scratch[slot].second; return VG_OK; }
     if (v->scratch[slot].second) destroy_buffer(v, v->scratch[slot].second);
     VG_VKBuffer *b = nullptr;
-    VG_Status s = make_buffer(v, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, &b);
+    VG_Status s = make_buffer(v, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, &b);
     if (s != VG_OK) { v->scratch[slot] = {0, nullptr}; return s; }
     v->scratch[slot] = {bytes, b};
     *out = b;
