@@ -44,6 +44,10 @@ static const VG_GGUF_Tensor *find_tensor(const VG_ModelGraph *g, const char *nam
 
 static VG_Status acquire_weight(VG_ModelGraph *g, const char *name, VG_TensorLease *lease);
 
+/* Raw activation dumps of layer 0 (post-attn-norm and post-Q-proj). These print
+ * D floats per token to stderr, so they are off unless VG_DUMP=1. */
+static int vg_dump_on(void) { static int v = -1; if (v < 0) { const char *e = getenv("VG_DUMP"); v = (e && e[0] != '0') ? 1 : 0; } return v; }
+
 #ifdef VG_HAS_VULKAN
 static VG_Status vk_matmul(VG_ModelGraph *g, uint32_t ggml_type, const void *wdata, size_t wbytes,
                              const float *x, float *y, uint32_t out_dim, uint32_t in_dim);
@@ -382,7 +386,7 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
     } else {
         memcpy(g->work_embd, hidden, D * sizeof(float));
     }
-    if (layer == 0 && pos <= 1) {
+    if (vg_dump_on() && layer == 0 && pos <= 1) {
         fprintf(stderr, "[vg] DUMP an0");
         for (uint32_t di = 0; di < D; ++di) fprintf(stderr, " %.7g", g->work_embd[di]);
         fprintf(stderr, "\n");
@@ -449,7 +453,7 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
 #endif
         { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, q_proj, Q_dim, D); }
         }
-        if (layer == 0 && pos <= 1) {
+        if (vg_dump_on() && layer == 0 && pos <= 1) {
             fprintf(stderr, "[vg] DUMP q0");
             for (uint32_t di = 0; di < Q_dim; ++di) fprintf(stderr, " %.7g", q_proj[di]);
             fprintf(stderr, "\n");
@@ -1059,9 +1063,11 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
         release_weight(&lout);
 
         if (gpu_done) {
-            /* Final-head success skips the host output norm/lm_head below;
-             * ordinary dense GPU success retains the existing host finalisation. */
-            if (gpu_logits_done_local) goto after_layers;
+            /* Skip the layer loop tail. Whether the host finalisation below is
+             * also skipped is decided by gpu_logits_done_local at the
+             * `logits_ready` guard further down -- the plain dense path still
+             * needs the host output norm + lm_head, the fused final head
+             * already produced logits on device. */
             goto after_layers;
         }
         g->gpu_dense = 0;   /* permanent fallback for this process */
