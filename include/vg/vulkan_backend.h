@@ -73,6 +73,10 @@ VG_Status vg_vk_matvec_q4_0(VG_VK *vk, const VG_VKBuffer *weights, const VG_VKBu
                            const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
 VG_Status vg_vk_matvec_q8_0(VG_VK *vk, const VG_VKBuffer *weights, const VG_VKBuffer *scales,
                            const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
+/* Q4_K matvec reading the raw on-disk GGML blocks directly (no repack).
+ * weights is a device buffer holding the tensor's native 144-byte blocks. */
+VG_Status vg_vk_matvec_q4_k(VG_VK *vk, const VG_VKBuffer *weights,
+                           const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
 
 /* RMSNorm: out[i] = input[i] / sqrt(mean(input^2) + eps) * weight[i].
  * input and weight are device buffers; out is host output (dim floats). */
@@ -137,6 +141,18 @@ VG_Status vg_vk_moe_head(VG_VK *vk,
  * host `hidden_in` is staged into it, when last!=0 it is copied back to
  * `hidden_out`. KV caches are position-major [n_ctx][KV_dim] device buffers.
  * Requires Q8_0 weights, H*HD==D, no q/k norm or biases (caller verifies). */
+/* Optional device-resident finalisation for the dense token path.
+ * When supplied, output RMSNorm and the Q8 lm_head are recorded into the
+ * same command buffer as the transformer layers. Only the final logits are
+ * copied back to host memory. */
+typedef struct VG_VKFinalHead {
+    const VG_VKBuffer *norm_w;
+    const VG_VKBuffer *lm_w, *lm_s;
+    uint32_t vocab, D;
+    float eps;
+    float *logits_out;
+} VG_VKFinalHead;
+
 typedef struct VG_VKDenseLayer {
     const VG_VKBuffer *attn_norm_w;
     const VG_VKBuffer *q_w, *q_s, *k_w, *k_s, *v_w, *v_s;
@@ -160,6 +176,8 @@ VG_Status vg_vk_dense_layer(VG_VK *vk, const VG_VKDenseLayer *d);
  * wait per token instead of one per layer). L[0].first stages hidden_in and
  * L[n-1].last reads hidden_out back; intermediate layers keep hidden on device. */
 VG_Status vg_vk_dense_forward(VG_VK *vk, const VG_VKDenseLayer *layers, uint32_t n);
+VG_Status vg_vk_dense_forward_final(VG_VK *vk, const VG_VKDenseLayer *layers, uint32_t n,
+                                    const VG_VKFinalHead *head);
 #ifdef __cplusplus
 }
 #endif

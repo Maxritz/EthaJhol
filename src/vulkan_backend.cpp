@@ -61,6 +61,7 @@ struct VG_VK {
     VG_VKPipeline matvec_f32;
     VG_VKPipeline matvec_q4_0;
     VG_VKPipeline matvec_q8_0;
+    VG_VKPipeline matvec_q4_k;
     VG_VKPipeline rmsnorm;
     VG_VKPipeline rope;
     VG_VKPipeline rope_adj;
@@ -401,6 +402,8 @@ VG_Status vg_vk_open(const VG_VKConfig *cfg, VG_VK **out) {
         s = create_pipeline(v, &v->matvec_q8_0, "matvec_q8_0.comp.spv", 5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
         if (s != VG_OK) { vg_vk_close(v); return s; }
     }
+    s = create_pipeline(v, &v->matvec_q4_k, "matvec_q4_k.comp.spv", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
+    if (s != VG_OK) { vg_vk_close(v); return s; }
     s = create_pipeline(v, &v->rmsnorm, "rmsnorm.comp.spv", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
     if (s != VG_OK) { vg_vk_close(v); return s; }
     s = create_pipeline(v, &v->rope, "rope.comp.spv", 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24);
@@ -432,6 +435,7 @@ void vg_vk_close(VG_VK *v) {
     destroy_pipeline(v, &v->matvec_f32);
     destroy_pipeline(v, &v->matvec_q4_0);
     destroy_pipeline(v, &v->matvec_q8_0);
+    destroy_pipeline(v, &v->matvec_q4_k);
     destroy_pipeline(v, &v->rmsnorm);
     destroy_pipeline(v, &v->rope);
     destroy_pipeline(v, &v->rope_adj);
@@ -633,6 +637,43 @@ VG_Status vg_vk_matvec_q8_0(VG_VK *v, const VG_VKBuffer *weights, const VG_VKBuf
     (void)rows;
     VG_VKMatvecReq r{weights, scales, x, y, input, output};
     return dispatch_matvec_batch(v, &v->matvec_q8_0, &r, 1, 1);
+}
+
+VG_Status vg_vk_matvec_q4_k(VG_VK *v, const VG_VKBuffer *w, const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output) {
+    (void)rows;
+    if (!v || !w || !x || !y || !output || !input) return VG_E_INVALID;
+    if (input % 256u) return VG_E_UNSUPPORTED;
+    if (!v->matvec_q4_k.pipeline) return VG_E_UNSUPPORTED;
+    uint64_t t0 = vg_trace_now_ns();
+    VG_VKBuffer *xs=nullptr,*xd=nullptr,*ys=nullptr,*yd=nullptr;
+    VG_Status s;
+    if ((s = vg_vk_scratch_acquire(v, 950u, (size_t)input*4u, &xs)) != VG_OK) return s;
+    if ((s = devbuf_acquire(v, 950u, (size_t)input*4u, &xd)) != VG_OK) return s;
+    if ((s = vg_vk_scratch_acquire(v, 951u, (size_t)output*4u, &ys)) != VG_OK) return s;
+    if ((s = devbuf_acquire(v, 951u, (size_t)output*4u, &yd)) != VG_OK) return s;
+    std::memcpy(xs->mapped, x, (size_t)input*4u);
+    VkDescriptorSet set = v->matvec_q4_k.sets[v->matvec_q4_k.ring_next];
+    v->matvec_q4_k.ring_next = (v->matvec_q4_k.ring_next + 1u) % VG_VK_DESC_RING;
+    { VG_VKBuffer *bb[3] = {(VG_VKBuffer *)w, xd, yd}; bind_buffers(v, set, bb, 3); }
+    s = submit_one(v, [&](VkCommandBuffer cb) {
+        VkBufferCopy c{}; c.size = (size_t)input*4u;
+        vkCmdCopyBuffer(cb, xs->buffer, xd->buffer, 1, &c);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,1,&mb,0,nullptr,0,nullptr);
+        uint32_t p[2] = {output, input};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, v->matvec_q4_k.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, v->matvec_q4_k.layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, v->matvec_q4_k.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+        vkCmdDispatch(cb, (output + 7u) / 8u, 1, 1);
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,1,&mb,0,nullptr,0,nullptr);
+        c.size = (size_t)output*4u;
+        vkCmdCopyBuffer(cb, yd->buffer, ys->buffer, 1, &c);
+    });
+    if (s == VG_OK) s = vg_vk_buffer_read(v, ys, y, (size_t)output*4u);
+    vg_trace_emit("vk_matvec_q4_k", t0, vg_trace_now_ns(), (size_t)output*input/2u, 1);
+    return s;
 }
 
 VG_Status vg_vk_rmsnorm(VG_VK *v, const VG_VKBuffer *input, const VG_VKBuffer *weight, float *out, uint32_t dim, float eps) {
@@ -864,7 +905,7 @@ VG_Status vg_vk_moe_head(VG_VK *v,
     return s;
 }
 
-VG_Status vg_vk_dense_forward(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n) {
+static VG_Status vg_vk_dense_forward_impl(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n, const VG_VKFinalHead *head) {
     if (!v || !L || !n) return VG_E_INVALID;
     uint32_t D=L[0].D, FF=L[0].FF, Q=L[0].Q_dim, KV=L[0].KV_dim, H=L[0].H, HKV=L[0].HKV, HD=L[0].HD;
     if (!D || !FF || !Q || !KV || !H || !HKV || !HD) return VG_E_INVALID;
@@ -891,7 +932,13 @@ VG_Status vg_vk_dense_forward(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n) {
     };
     VG_Status s;
     for (uint32_t i = 0; i < 20; ++i) if ((s = devbuf_acquire(v, 600u + i, sz[i], &B[i])) != VG_OK) return s;
-    VG_VKBuffer *S_h = nullptr, *S_out = nullptr;
+    VG_VKBuffer *S_h = nullptr, *S_out = nullptr, *S_logits = nullptr, *B_logits = nullptr;
+    if (head) {
+        if (!head->norm_w || !head->lm_w || !head->lm_s || !head->vocab || head->vocab > (1u << 24) ||
+            head->D != D || !head->logits_out) return VG_E_INVALID;
+        if ((s = devbuf_acquire(v, 620u, (size_t)head->vocab * 4u, &B_logits)) != VG_OK) return s;
+        if ((s = vg_vk_scratch_acquire(v, 602u, (size_t)head->vocab * 4u, &S_logits)) != VG_OK) return s;
+    }
     if (L[0].first && L[0].hidden_in) {
         if ((s = vg_vk_scratch_acquire(v, 600u, (size_t)D*4u, &S_h)) != VG_OK) return s;
         std::memcpy(S_h->mapped, L[0].hidden_in, (size_t)D*4u);
@@ -913,7 +960,8 @@ VG_Status vg_vk_dense_forward(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n) {
         auto mvec=[&](const VkDescriptorSet &set,uint32_t rows,uint32_t cols){ uint32_t pp[2]={rows,cols};
             vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,v->matvec_q8_0.pipeline);
             vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,v->matvec_q8_0.layout,0,1,&set,0,nullptr);
-            vkCmdPushConstants(cb,v->matvec_q8_0.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,pp); vkCmdDispatch(cb,rows,1,1); };
+            vkCmdPushConstants(cb,v->matvec_q8_0.layout,VK_SHADER_STAGE_COMPUTE_BIT,0,8,pp);
+            vkCmdDispatch(cb,(rows+7u)/8u,1,1); };
         auto rnorm=[&](const VkDescriptorSet &set,uint32_t dim,float eps){ struct{uint32_t d;float e;} p={dim,eps};
             vkCmdBindPipeline(cb,VK_PIPELINE_BIND_POINT_COMPUTE,v->rmsnorm.pipeline);
             vkCmdBindDescriptorSets(cb,VK_PIPELINE_BIND_POINT_COMPUTE,v->rmsnorm.layout,0,1,&set,0,nullptr);
@@ -1009,9 +1057,57 @@ VG_Status vg_vk_dense_forward(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n) {
                 bar();  /* hidden_dev is read by the next layer's attn_norm */
             }
         }
+
+        /* Final dense token path: keep the final hidden state on the device,
+         * perform output RMSNorm + Q8 lm_head in this same command buffer,
+         * then stage only the logits. This removes the GPU->CPU->GPU detour
+         * and the second queue submission previously used by model_graph.c. */
+        if (head) {
+            VkDescriptorSet FRN = rn->sets[rn->ring_next];
+            rn->ring_next = (rn->ring_next + 1u) % VG_VK_DESC_RING;
+            VkDescriptorSet FAQ = aq->sets[aq->ring_next];
+            aq->ring_next = (aq->ring_next + 1u) % VG_VK_DESC_RING;
+            VkDescriptorSet FMV = mv->sets[mv->ring_next];
+            mv->ring_next = (mv->ring_next + 1u) % VG_VK_DESC_RING;
+
+            { VG_VKBuffer *bb[3] = {L[n-1].hidden_dev, (VG_VKBuffer *)head->norm_w, B[10]};
+              bind_buffers(v, FRN, bb, 3); }
+            /* act_quant bindings are (X, xd, xq). B[12] is only nbD*4 bytes
+             * (per-block fp32 scales); the quantized payload needs nbD*32 and
+             * must go to B[13], matching AQ[0]={B[0],B[1],B[2]} above. */
+            { VG_VKBuffer *bb[3] = {B[10], B[12], B[13]};
+              bind_buffers(v, FAQ, bb, 3); }
+            { VG_VKBuffer *bb[5] = {(VG_VKBuffer *)head->lm_w, (VG_VKBuffer *)head->lm_s,
+                                    B[12], B[13], B_logits};
+              bind_buffers(v, FMV, bb, 5); }
+
+            rnorm(FRN, D, head->eps); bar();
+            quant(FAQ, D / 32u); bar();
+            mvec(FMV, head->vocab, D);
+
+            mb.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+            mb.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &mb, 0, nullptr, 0, nullptr);
+            VkBufferCopy lc{}; lc.size = (size_t)head->vocab * 4u;
+            vkCmdCopyBuffer(cb, B_logits->buffer, S_logits->buffer, 1, &lc);
+        }
     });
-    if (s == VG_OK && S_out) s = vg_vk_buffer_read(v, S_out, L[n-1].hidden_out, (size_t)D*4u);
+    if (s == VG_OK && head)
+        s = vg_vk_buffer_read(v, S_logits, head->logits_out, (size_t)head->vocab * 4u);
+    else if (s == VG_OK && S_out)
+        s = vg_vk_buffer_read(v, S_out, L[n-1].hidden_out, (size_t)D*4u);
     return s;
+}
+
+VG_Status vg_vk_dense_forward(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n) {
+    return vg_vk_dense_forward_impl(v, L, n, nullptr);
+}
+
+VG_Status vg_vk_dense_forward_final(VG_VK *v, const VG_VKDenseLayer *L, uint32_t n,
+                                    const VG_VKFinalHead *head) {
+    if (!head) return VG_E_INVALID;
+    return vg_vk_dense_forward_impl(v, L, n, head);
 }
 
 VG_Status vg_vk_dense_layer(VG_VK *v, const VG_VKDenseLayer *d) {

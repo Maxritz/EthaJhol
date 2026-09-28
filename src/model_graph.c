@@ -995,6 +995,7 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
     if (!g) return VG_E_INVALID;
     if ((uint32_t)kv_pos >= g->cfg.n_ctx) return VG_E_RANGE;
     uint32_t D = g->cfg.n_embd;
+    int gpu_logits_done_local = 0;
     float pos_f = (float)kv_pos;
 
     VG_Status st = vg_model_graph_embed(g, input_token, g->work_embd);
@@ -1012,9 +1013,60 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
         int all_ok = g->gpu_dense ? 1 : 0;
         for (uint32_t l = 0; all_ok && l < nl; ++l)
             if (!dense_gpu_layer_forward(g, l, (uint32_t)kv_pos, l == 0, l + 1 == nl, g->work_embd, &g->gpu_layers[l])) all_ok = 0;
-        if (all_ok && vg_vk_dense_forward(g->vk, g->gpu_layers, nl) == VG_OK) goto after_layers;
+
+        /* Prepare the optional device-resident final RMSNorm + Q8 lm_head.
+         * Failure here must not disable the already-valid fused transformer
+         * path: it simply falls back to the existing host finalisation. */
+        VG_VKFinalHead final_head;
+        memset(&final_head, 0, sizeof(final_head));
+        VG_TensorLease loutn, lout;
+        memset(&loutn, 0, sizeof(loutn));
+        memset(&lout, 0, sizeof(lout));
+        VG_VKBuffer *final_norm = NULL, *final_lmw = NULL, *final_lms = NULL;
+        const VG_GGUF_Tensor *lt_final = find_tensor(g, "output.weight");
+        if (!lt_final) lt_final = find_tensor(g, "token_embd.weight");
+        int final_ok = 0;
+        if (all_ok && lt_final && lt_final->ggml_type == 8 &&
+            acquire_weight(g, "output_norm.weight", &loutn) == VG_OK &&
+            acquire_weight(g, lt_final->name, &lout) == VG_OK) {
+            int prep_ok =
+                (vg_vk_cache_get(g->vk, loutn.tensor, 0x9200u, &final_norm) == VG_OK ||
+                 vg_vk_cache_acquire(g->vk, loutn.tensor, 0x9200u, loutn.data,
+                                     (size_t)D * sizeof(float), &final_norm) == VG_OK) &&
+                (vk_q8_prepare(g, lout.tensor, 0x30000u, lout.data,
+                               g->cfg.n_vocab, D, &final_lmw, &final_lms) == VG_OK);
+            if (prep_ok) {
+                final_head.norm_w = final_norm;
+                final_head.lm_w = final_lmw;
+                final_head.lm_s = final_lms;
+                final_head.vocab = g->cfg.n_vocab;
+                final_head.D = D;
+                final_head.eps = g->cfg.rms_eps;
+                final_head.logits_out = g->logits;
+                final_ok = 1;
+            }
+        }
+
+        int gpu_done = 0;
+        if (final_ok && vg_vk_dense_forward_final(g->vk, g->gpu_layers, nl, &final_head) == VG_OK) {
+            gpu_done = 1;
+            gpu_logits_done_local = 1;
+        }
+        else if (all_ok && vg_vk_dense_forward(g->vk, g->gpu_layers, nl) == VG_OK)
+            gpu_done = 1;
+
+        release_weight(&loutn);
+        release_weight(&lout);
+
+        if (gpu_done) {
+            /* Final-head success skips the host output norm/lm_head below;
+             * ordinary dense GPU success retains the existing host finalisation. */
+            if (gpu_logits_done_local) goto after_layers;
+            goto after_layers;
+        }
         g->gpu_dense = 0;   /* permanent fallback for this process */
     }
+
 #endif
 
     for (uint32_t l = 0; l < g->cfg.n_layer; ++l) {
@@ -1041,6 +1093,9 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
 after_layers: ;
 #endif
     char name[128]; VG_TensorLease wl;
+#ifdef VG_HAS_VULKAN
+    if (gpu_logits_done_local) goto logits_ready;
+#endif
     snprintf(name, sizeof(name), "output_norm.weight");
     if (acquire_weight(g, name, &wl) == VG_OK) {
         vg_cpu_rmsnorm(g->work_embd, g->work_embd, (const float *)wl.data, D, g->cfg.rms_eps);
@@ -1112,6 +1167,9 @@ after_layers: ;
         memset(g->logits, 0, g->cfg.n_vocab * sizeof(float));
     }
 
+#ifdef VG_HAS_VULKAN
+logits_ready:
+#endif
     if (logits_out) memcpy(logits_out, g->logits, g->cfg.n_vocab * sizeof(float));
     return VG_OK;
 }
@@ -1180,6 +1238,18 @@ static VG_Status vk_matmul(VG_ModelGraph *g, uint32_t ggml_type, const void *wda
         return vg_vk_matvec_f16_batch(g->vk, &r, 1);
     }
 
+    if (ggml_type == 12) {
+        /* Q4_K: upload the raw 144-byte blocks once (keyed by the stable mmap
+         * data pointer) and run the on-disk-layout matvec kernel. */
+        if (in_dim % 256u) return VG_E_UNSUPPORTED;
+        VG_VKBuffer *wb = NULL;
+        if (vg_vk_cache_get(g->vk, wdata, 0, &wb) != VG_OK) {
+            VG_Status st = vg_vk_cache_acquire(g->vk, wdata, 0, wdata, wbytes, &wb);
+            if (st != VG_OK) return st;
+        }
+        return vg_vk_matvec_q4_k(g->vk, wb, x, y, out_dim, in_dim, out_dim);
+    }
+
     return VG_E_UNSUPPORTED;
 }
 
@@ -1241,6 +1311,15 @@ static VG_Status vk_matmul_slice(VG_ModelGraph *g, uint32_t ggml_type, const voi
         r.weights = wb; r.scales = sb; r.x = x; r.y = y; r.in_dim = in_dim; r.out_dim = out_dim;
         if (ggml_type == 0) return vg_vk_matvec_f32_batch(g->vk, &r, 1);
         return vg_vk_matvec_f16_batch(g->vk, &r, 1);
+    }
+    if (ggml_type == 12) {
+        if (in_dim % 256u) return VG_E_UNSUPPORTED;
+        VG_VKBuffer *wb = NULL;
+        if (vg_vk_cache_get(g->vk, key, tag, &wb) != VG_OK) {
+            VG_Status st = vg_vk_cache_acquire(g->vk, key, tag, wdata, wbytes, &wb);
+            if (st != VG_OK) return st;
+        }
+        return vg_vk_matvec_q4_k(g->vk, wb, x, y, out_dim, in_dim, out_dim);
     }
     return VG_E_UNSUPPORTED;
 }
