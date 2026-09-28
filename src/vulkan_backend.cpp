@@ -62,6 +62,7 @@ struct VG_VK {
     VG_VKPipeline matvec_q4_0;
     VG_VKPipeline matvec_q8_0;
     VG_VKPipeline matvec_q4_k;
+    VG_VKPipeline matvec_q6_k;
     VG_VKPipeline rmsnorm;
     VG_VKPipeline rope;
     VG_VKPipeline rope_adj;
@@ -404,6 +405,8 @@ VG_Status vg_vk_open(const VG_VKConfig *cfg, VG_VK **out) {
     }
     s = create_pipeline(v, &v->matvec_q4_k, "matvec_q4_k.comp.spv", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
     if (s != VG_OK) { vg_vk_close(v); return s; }
+    s = create_pipeline(v, &v->matvec_q6_k, "matvec_q6_k.comp.spv", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
+    if (s != VG_OK) { vg_vk_close(v); return s; }
     s = create_pipeline(v, &v->rmsnorm, "rmsnorm.comp.spv", 3, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 8);
     if (s != VG_OK) { vg_vk_close(v); return s; }
     s = create_pipeline(v, &v->rope, "rope.comp.spv", 1, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 24);
@@ -436,6 +439,7 @@ void vg_vk_close(VG_VK *v) {
     destroy_pipeline(v, &v->matvec_q4_0);
     destroy_pipeline(v, &v->matvec_q8_0);
     destroy_pipeline(v, &v->matvec_q4_k);
+    destroy_pipeline(v, &v->matvec_q6_k);
     destroy_pipeline(v, &v->rmsnorm);
     destroy_pipeline(v, &v->rope);
     destroy_pipeline(v, &v->rope_adj);
@@ -673,6 +677,43 @@ VG_Status vg_vk_matvec_q4_k(VG_VK *v, const VG_VKBuffer *w, const float *x, floa
     });
     if (s == VG_OK) s = vg_vk_buffer_read(v, ys, y, (size_t)output*4u);
     vg_trace_emit("vk_matvec_q4_k", t0, vg_trace_now_ns(), (size_t)output*input/2u, 1);
+    return s;
+}
+
+VG_Status vg_vk_matvec_q6_k(VG_VK *v, const VG_VKBuffer *w, const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output) {
+    (void)rows;
+    if (!v || !w || !x || !y || !output || !input) return VG_E_INVALID;
+    if (input % 256u) return VG_E_UNSUPPORTED;
+    if (!v->matvec_q6_k.pipeline) return VG_E_UNSUPPORTED;
+    uint64_t t0 = vg_trace_now_ns();
+    VG_VKBuffer *xs=nullptr,*xd=nullptr,*ys=nullptr,*yd=nullptr;
+    VG_Status s;
+    if ((s = vg_vk_scratch_acquire(v, 952u, (size_t)input*4u, &xs)) != VG_OK) return s;
+    if ((s = devbuf_acquire(v, 952u, (size_t)input*4u, &xd)) != VG_OK) return s;
+    if ((s = vg_vk_scratch_acquire(v, 953u, (size_t)output*4u, &ys)) != VG_OK) return s;
+    if ((s = devbuf_acquire(v, 953u, (size_t)output*4u, &yd)) != VG_OK) return s;
+    std::memcpy(xs->mapped, x, (size_t)input*4u);
+    VkDescriptorSet set = v->matvec_q6_k.sets[v->matvec_q6_k.ring_next];
+    v->matvec_q6_k.ring_next = (v->matvec_q6_k.ring_next + 1u) % VG_VK_DESC_RING;
+    { VG_VKBuffer *bb[3] = {(VG_VKBuffer *)w, xd, yd}; bind_buffers(v, set, bb, 3); }
+    s = submit_one(v, [&](VkCommandBuffer cb) {
+        VkBufferCopy c{}; c.size = (size_t)input*4u;
+        vkCmdCopyBuffer(cb, xs->buffer, xd->buffer, 1, &c);
+        VkMemoryBarrier mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        mb.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_SHADER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,1,&mb,0,nullptr,0,nullptr);
+        uint32_t p[2] = {output, input};
+        vkCmdBindPipeline(cb, VK_PIPELINE_BIND_POINT_COMPUTE, v->matvec_q6_k.pipeline);
+        vkCmdBindDescriptorSets(cb, VK_PIPELINE_BIND_POINT_COMPUTE, v->matvec_q6_k.layout, 0, 1, &set, 0, nullptr);
+        vkCmdPushConstants(cb, v->matvec_q6_k.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(p), p);
+        vkCmdDispatch(cb, (output + 7u) / 8u, 1, 1);
+        mb.srcAccessMask=VK_ACCESS_SHADER_WRITE_BIT; mb.dstAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
+        vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0,1,&mb,0,nullptr,0,nullptr);
+        c.size = (size_t)output*4u;
+        vkCmdCopyBuffer(cb, yd->buffer, ys->buffer, 1, &c);
+    });
+    if (s == VG_OK) s = vg_vk_buffer_read(v, ys, y, (size_t)output*4u);
+    vg_trace_emit("vk_matvec_q6_k", t0, vg_trace_now_ns(), (size_t)output*input/2u, 1);
     return s;
 }
 

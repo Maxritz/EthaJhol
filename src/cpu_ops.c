@@ -131,23 +131,29 @@ void vg_cpu_matmul_q6_k(const void *W, const float *x, float *y, uint32_t out_di
         float acc = 0.0f;
         for (uint32_t ib = 0; ib < nbs; ++ib) {
             float d = half_to_float(b[ib].d);
-            const int8_t *sc = b[ib].scales;
             const uint8_t *ql = b[ib].ql;
             const uint8_t *qh = b[ib].qh;
-            for (int l = 0; l < 32; ++l) {
-                int is = l / 16;
-                int32_t v1 = (int32_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                int32_t v2 = (int32_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                int32_t v3 = (int32_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int32_t v4 = (int32_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                float dx1 = d * sc[is + 0];
-                float dx2 = d * sc[is + 2];
-                float dx3 = d * sc[is + 4];
-                float dx4 = d * sc[is + 6];
-                acc += dx1 * v1 * x[ib*bs + l];
-                acc += dx2 * v2 * x[ib*bs + 32 + l];
-                acc += dx3 * v3 * x[ib*bs + 64 + l];
-                acc += dx4 * v4 * x[ib*bs + 96 + l];
+            const int8_t *sc = b[ib].scales;
+            /* Q6_K stores 256 values as TWO 128-value halves; ql/qh/sc advance
+             * by 64/32/8 per half and the second half indexes x[128..255]. The
+             * old loop only handled the first half, silently dropping half of
+             * every block (broke all Q6_K and every Q*_K_M model). */
+            for (int half = 0; half < 2; ++half) {
+                const uint8_t *qlh = ql + half * 64;
+                const uint8_t *qhh = qh + half * 32;
+                const int8_t *sch = sc + half * 8;
+                uint32_t xoff = ib * bs + (uint32_t)half * 128u;
+                for (int l = 0; l < 32; ++l) {
+                    int is = l / 16;
+                    int32_t v1 = (int32_t)((qlh[l] & 0xF) | (((qhh[l] >> 0) & 3) << 4)) - 32;
+                    int32_t v2 = (int32_t)((qlh[l + 32] & 0xF) | (((qhh[l] >> 2) & 3) << 4)) - 32;
+                    int32_t v3 = (int32_t)((qlh[l] >> 4) | (((qhh[l] >> 4) & 3) << 4)) - 32;
+                    int32_t v4 = (int32_t)((qlh[l + 32] >> 4) | (((qhh[l] >> 6) & 3) << 4)) - 32;
+                    acc += d * sch[is + 0] * v1 * x[xoff + l];
+                    acc += d * sch[is + 2] * v2 * x[xoff + 32 + l];
+                    acc += d * sch[is + 4] * v3 * x[xoff + 64 + l];
+                    acc += d * sch[is + 6] * v4 * x[xoff + 96 + l];
+                }
             }
         }
         y[row] = acc;

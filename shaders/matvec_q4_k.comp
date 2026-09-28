@@ -1,0 +1,78 @@
+#version 450
+// Q4_K matvec (GGML type 12), reading the on-disk block layout DIRECTLY (no
+// repack): block_q4_K = { fp16 d; fp16 dmin; uint8 scales[12]; uint8 qs[128] }
+// = 144 bytes per 256 weights.
+//   w[i] = d * sc_g * nib - dmin * m_g,  g = i/32 (0..7)
+// Each workgroup (256 lanes = 8 sub-groups of 32) computes 8 output rows; the
+// sub-group's 32 lanes handle the 8 value-groups (lane = within-group offset),
+// so the per-block scale/min unpack is uniform.
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };   // raw Q4_K bytes
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Params { uint out_dim; uint in_dim; } p;
+
+shared uint  sblk[8][36];   // one 144-byte block per sub-group, as 36 u32
+shared float red[8][32];
+
+float decode_f16(uint h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mantissa = h & 0x3ffu;
+    uint f;
+    if (exp == 0u) {
+        if (mantissa == 0u) { f = sign << 31u; }
+        else {
+            int e = -1; uint m = mantissa;
+            do { m <<= 1u; ++e; } while ((m & 0x400u) == 0u);
+            m &= 0x3ffu;
+            f = (sign << 31u) | (uint(127 - 15 - e) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
+    else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
+    return uintBitsToFloat(f);
+}
+
+uint pb(uint gi, uint i) { return (sblk[gi][i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+void main() {
+    uint gi   = gl_LocalInvocationID.x >> 5u;
+    uint lane = gl_LocalInvocationID.x & 31u;
+    uint row  = gl_WorkGroupID.x * 8u + gi;
+    uint nblk = p.in_dim / 256u;
+    uint row_bytes = nblk * 144u;
+    uint base = row * row_bytes;
+    bool valid = (row < p.out_dim);
+
+    float acc = 0.0;
+    for (uint mb = 0u; mb < nblk; ++mb) {
+        if (valid) for (uint jw = lane; jw < 36u; jw += 32u) sblk[gi][jw] = w[(base >> 2u) + mb * 36u + jw];
+        barrier();
+        if (valid) {
+            float d    = decode_f16(pb(gi, 0u) | (pb(gi, 1u) << 8u));
+            float dmin = decode_f16(pb(gi, 2u) | (pb(gi, 3u) << 8u));
+            for (uint g = 0u; g < 8u; ++g) {
+                uint sc, mn;
+                if (g < 4u) { sc = pb(gi, 4u + g) & 63u; mn = pb(gi, 8u + g) & 63u; }
+                else {
+                    sc = (pb(gi, 8u + g) & 0xFu) | ((pb(gi, g) >> 6u) << 4u);
+                    mn = (pb(gi, 8u + g) >> 4u) | ((pb(gi, 4u + g) >> 6u) << 4u);
+                }
+                uint qbyte = pb(gi, 16u + 32u * (g >> 1u) + lane);
+                uint nib = ((g & 1u) == 0u) ? (qbyte & 0xFu) : (qbyte >> 4u);
+                float val = d * float(sc) * float(nib) - dmin * float(mn);
+                acc += val * x[mb * 256u + g * 32u + lane];
+            }
+        }
+        barrier();
+    }
+
+    red[gi][lane] = acc;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) red[gi][lane] += red[gi][lane + s];
+        barrier();
+    }
+    if (lane == 0u && valid) y[row] = red[gi][0];
+}

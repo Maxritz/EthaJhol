@@ -37,7 +37,9 @@ if(VG_ENABLE_VULKAN)
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_f16.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_f32.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q4_0.comp
-      ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q8_0.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q8_0.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q4_k.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q6_k.comp
 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/activation_quant_q8.comp
 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/attn_scores.comp
 ${CMAKE_CURRENT_SOURCE_DIR}/shaders/resid_add.comp

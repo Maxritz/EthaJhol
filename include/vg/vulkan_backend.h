@@ -76,7 +76,11 @@ VG_Status vg_vk_matvec_q8_0(VG_VK *vk, const VG_VKBuffer *weights, const VG_VKBu
 /* Q4_K matvec reading the raw on-disk GGML blocks directly (no repack).
  * weights is a device buffer holding the tensor's native 144-byte blocks. */
 VG_Status vg_vk_matvec_q4_k(VG_VK *vk, const VG_VKBuffer *weights,
-                           const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
+                            const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
+/* Q6_K matvec reading the raw on-disk GGML blocks directly (no repack).
+ * weights is a device buffer holding the tensor's native 210-byte blocks. */
+VG_Status vg_vk_matvec_q6_k(VG_VK *vk, const VG_VKBuffer *weights,
+                            const float *x, float *y, uint32_t rows, uint32_t input, uint32_t output);
 
 /* RMSNorm: out[i] = input[i] / sqrt(mean(input^2) + eps) * weight[i].
  * input and weight are device buffers; out is host output (dim floats). */

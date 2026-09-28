@@ -626,6 +626,11 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             if (hk) { for (uint32_t d = 0; d < HD; ++d) dot += hq[d] * hk[d]; }
             scores[t] = dot * scale;
         }
+        if (vg_dump_on() && layer == 0 && pos == 4 && h == 0) {
+            fprintf(stderr, "[vg] scs");
+            for (uint32_t t = 0; t < n_past; ++t) fprintf(stderr, " %.3f", scores[t]);
+            fprintf(stderr, "\n");
+        }
 
         float mx = scores[0];
         for (uint32_t t = 1; t < n_past; ++t) if (scores[t] > mx) mx = scores[t];
@@ -639,14 +644,18 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             uint32_t lpg = layer * kv_capacity + pi;
             float *hv = (g->kv_v[lpg]) ? (g->kv_v[lpg] + so) : NULL;
             float w = scores[t];
+            if (vg_dump_on() && layer == 0 && h == 0) {
+                fprintf(stderr, "[vg] v%u %s [%.4f %.4f %.4f %.4f]\n", t, hv ? "P" : "N", hv ? hv[0] : 0.f, hv ? hv[1] : 0.f, hv ? hv[2] : 0.f, hv ? hv[3] : 0.f);
+            }
             if (hv) { for (uint32_t d = 0; d < kv_hdim; ++d) g->work_att_out[h * kv_hdim + d] += w * hv[d]; }
         }
         free(scores);
     }
 
     int fused_moe_head = moe_fused_head_ok(g);
+    int layer_tail_will_fuse = vg_layer_tail_on() && g->vk != NULL;
     snprintf(name, sizeof(name), "blk.%u.attn_output.weight", layer);
-    if (!fused_moe_head && (!vg_layer_tail_on() || find_tensor(g, "blk.0.ffn_gate_inp.weight") != NULL) && acquire_weight(g, name, &l) == VG_OK) {
+    if (!fused_moe_head && (!layer_tail_will_fuse || find_tensor(g, "blk.0.ffn_gate_inp.weight") != NULL) && acquire_weight(g, name, &l) == VG_OK) {
         float *po = (float *)malloc(D * sizeof(float));
         if (po) {
 #ifdef VG_HAS_VULKAN
@@ -666,6 +675,7 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
     free(k_full); free(v_full);
 }
 
+static int vg_mmtrace(void);
 static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
     uint32_t D = g->cfg.n_embd;
     uint32_t FF = g->cfg.n_ff;
@@ -764,7 +774,12 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
                 if (!(g->vk && vk_matmul(g, lo.tensor->ggml_type, lo.data, lo.size, g->work_att_out, po, D, adim)==VG_OK))
                     vg_cpu_matmul(lo.tensor->ggml_type, lo.data, g->work_att_out, po, D, adim);
                 for (uint32_t i=0;i<D;++i) hidden[i] = g->work_res[i] + po[i];
+                /* Residual base for the per-op FFN below must be the
+                 * post-attention hidden (work_res is still pre-attention here
+                 * because the fused tail -- not attention_layer -- owns o_proj). */
+                memcpy(g->work_res, hidden, D * sizeof(float));
                 free(po);
+                if (vg_dump_on()) fprintf(stderr, "[vg] tlfall l%u merged\n", layer);
             }
         }
         release_weight(&lo); release_weight(&ln); release_weight(&lg); release_weight(&lu); release_weight(&ld);
@@ -906,6 +921,7 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
     }
 
     if (g->cfg.has_gate_up) {
+        if (vg_mmtrace()) fprintf(stderr, "[vgmm] gateup-branch D=%u FF=%u\n", D, FF);
 #ifdef VG_HAS_VULKAN
         if (g->vk) {
             VG_TensorLease fg, fu, fd; memset(&fg,0,sizeof(fg)); memset(&fu,0,sizeof(fu)); memset(&fd,0,sizeof(fd));
@@ -938,25 +954,31 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
         snprintf(gn, sizeof(gn), "blk.%u.ffn_gate.weight", layer);
         snprintf(un, sizeof(un), "blk.%u.ffn_up.weight", layer);
         if (gate_out && up_out && acquire_weight(g, gn, &lg) == VG_OK && acquire_weight(g, un, &lu) == VG_OK) {
-            int gpu_done = 0; /* COMPASS 3.1: gate+up in ONE submit */
+            int gpu_done = 0; /* COMPASS 3.1: gate+up in ONE submit (Q8_0) */
 #ifdef VG_HAS_VULKAN
-            if (g->vk && lg.tensor->ggml_type == 8 && lu.tensor->ggml_type == 8) {
-                VG_VKBuffer *wb = NULL, *sb = NULL;
-                VG_VKMatvecReq rq[2];
-                if (vk_q8_prepare(g, lg.tensor, 0u, lg.data, FF, D, &wb, &sb) == VG_OK) {
-                    rq[0].weights = wb; rq[0].scales = sb; rq[0].x = g->work_embd; rq[0].y = gate_out; rq[0].in_dim = D; rq[0].out_dim = FF;
-                    if (vk_q8_prepare(g, lu.tensor, 0u, lu.data, FF, D, &wb, &sb) == VG_OK) {
-                        rq[1].weights = wb; rq[1].scales = sb; rq[1].x = g->work_embd; rq[1].y = up_out; rq[1].in_dim = D; rq[1].out_dim = FF;
-                        if (vg_vk_matvec_q8_0_batch(g->vk, rq, 2) == VG_OK) gpu_done = 1;
+            if (g->vk) {
+                if (lg.tensor->ggml_type == 8 && lu.tensor->ggml_type == 8) {
+                    VG_VKBuffer *wb = NULL, *sb = NULL;
+                    VG_VKMatvecReq rq[2];
+                    if (vk_q8_prepare(g, lg.tensor, 0u, lg.data, FF, D, &wb, &sb) == VG_OK) {
+                        rq[0].weights = wb; rq[0].scales = sb; rq[0].x = g->work_embd; rq[0].y = gate_out; rq[0].in_dim = D; rq[0].out_dim = FF;
+                        if (vk_q8_prepare(g, lu.tensor, 0u, lu.data, FF, D, &wb, &sb) == VG_OK) {
+                            rq[1].weights = wb; rq[1].scales = sb; rq[1].x = g->work_embd; rq[1].y = up_out; rq[1].in_dim = D; rq[1].out_dim = FF;
+                            if (vg_vk_matvec_q8_0_batch(g->vk, rq, 2) == VG_OK) gpu_done = 1;
+                        }
                     }
-                }
+                } else if (vk_matmul(g, lg.tensor->ggml_type, lg.data, lg.size, g->work_embd, gate_out, FF, D) == VG_OK &&
+                           vk_matmul(g, lu.tensor->ggml_type, lu.data, lu.size, g->work_embd, up_out, FF, D) == VG_OK) gpu_done = 1;
             }
 #endif
+            if (vg_dump_on() && layer == 0) fprintf(stderr, "[vg] gu0 %.4f %.4f | guF %.4f %.4f\n", gate_out[0], up_out[0], gate_out[FF-1], up_out[FF-1]);
             if (!gpu_done) {
+                if (vg_mmtrace()) fprintf(stderr, "[vgmm] gup-cpu Gtype=%u Utype=%u\n", (unsigned)lg.tensor->ggml_type, (unsigned)lu.tensor->ggml_type);
                 vg_cpu_matmul(lg.tensor->ggml_type, lg.data, g->work_embd, gate_out, FF, D);
                 vg_cpu_matmul(lu.tensor->ggml_type, lu.data, g->work_embd, up_out, FF, D);
             }
             vg_cpu_swiglu(g->work_ffn, gate_out, up_out, FF);
+            if (vg_dump_on() && layer == 0) fprintf(stderr, "[vg] wf0 %.4f %.4f | wfF %.4f %.4f\n", g->work_ffn[0], g->work_ffn[1], g->work_ffn[FF-1], g->work_ffn[FF-2]);
         }
         release_weight(&lg); release_weight(&lu);
         free(gate_out); free(up_out);
@@ -986,8 +1008,10 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
             } else
 #endif
             {
+                if (vg_mmtrace()) fprintf(stderr, "[vgmm] down-cpu type=%u\n", (unsigned)l.tensor->ggml_type);
                 vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_ffn, down_out, D, FF);
             }
+            if (vg_dump_on() && layer == 0) fprintf(stderr, "[vg] dn0 %.4f %.4f\n", down_out[0], down_out[1]);
             for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + down_out[i];
             free(down_out);
         }
@@ -1086,8 +1110,14 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
         uint64_t ta0 = vg_trace_now_ns();
         attention_layer(g, l, g->work_embd, &pos_f);
         uint64_t ta1 = vg_trace_now_ns();
+        if (vg_dump_on() && (l == 0 || l == g->cfg.n_layer - 1)) {
+            fprintf(stderr, "[vg] at%u [%.6f %.6f %.6f %.6f]\n", l, g->work_embd[0], g->work_embd[1], g->work_embd[2], g->work_embd[3]);
+        }
         ffn_layer(g, l, g->work_embd);
         uint64_t ta2 = vg_trace_now_ns();
+        if (vg_dump_on() && (l == 0 || l == 7 || l == g->cfg.n_layer - 1)) {
+            fprintf(stderr, "[vg] hl%u [%.5f %.5f %.5f %.5f]\n", l, g->work_embd[0], g->work_embd[1], g->work_embd[2], g->work_embd[3]);
+        }
         {
             static uint64_t a_acc = 0, f_acc = 0; static uint64_t a_n = 0;
             a_acc += ta1 - ta0; f_acc += ta2 - ta1; ++a_n;
@@ -1107,6 +1137,7 @@ after_layers: ;
         vg_cpu_rmsnorm(g->work_embd, g->work_embd, (const float *)wl.data, D, g->cfg.rms_eps);
         release_weight(&wl);
     }
+    if (vg_dump_on()) fprintf(stderr, "[vg] hn [%.5f %.5f %.5f %.5f]\n", g->work_embd[0], g->work_embd[1], g->work_embd[2], g->work_embd[3]);
 
     /* Compute logits via output projection (lm_head). */
     const VG_GGUF_Tensor *lt = find_tensor(g, "output.weight");
@@ -1176,6 +1207,7 @@ after_layers: ;
 #ifdef VG_HAS_VULKAN
 logits_ready:
 #endif
+    if (vg_dump_on()) { float bv = -1e18f; int32_t bi = -1; for (uint32_t vi = 0; vi < g->cfg.n_vocab; ++vi) if (g->logits[vi] > bv) { bv = g->logits[vi]; bi = (int32_t)vi; } fprintf(stderr, "[vg] lg top=%d %.4f [%.4f %.4f %.4f %.4f]\n", bi, bv, g->logits[0], g->logits[1], g->logits[2], g->logits[3]); }
     if (logits_out) memcpy(logits_out, g->logits, g->cfg.n_vocab * sizeof(float));
     return VG_OK;
 }
@@ -1185,16 +1217,19 @@ const float *vg_model_graph_logits(const VG_ModelGraph *g) { return g ? g->logit
 #ifdef VG_HAS_VULKAN
 void vg_model_graph_set_vulkan(VG_ModelGraph *g, VG_VK *vk) { if (g) g->vk = vk; }
 
+static int vg_mmtrace(void) { static int v = -1; if (v < 0) { const char *e = getenv("VG_MMTRACE"); v = e ? 1 : 0; } return v; }
+#define MMDBG(reason) do { if (vg_mmtrace()) fprintf(stderr, "[vgmm] %-12s type=%u in=%u out=%u bytes=%zu\n", reason, ggml_type, in_dim, out_dim, wbytes); } while (0)
+
 static VG_Status vk_matmul(VG_ModelGraph *g, uint32_t ggml_type, const void *wdata, size_t wbytes,
                             const float *x, float *y, uint32_t out_dim, uint32_t in_dim) {
-    if (!g->vk) return VG_E_UNSUPPORTED;
-    if (!wdata || !x || !y || !out_dim || !in_dim) return VG_E_INVALID;
+    if (!g->vk) { MMDBG("no-device"); return VG_E_UNSUPPORTED; }
+    if (!wdata || !x || !y || !out_dim || !in_dim) { MMDBG("invalid-arg"); return VG_E_INVALID; }
 
     if (ggml_type == 8) {
         /* Q8_0 fast path: repack into aligned int8 blocks + fp16 scales ONCE,
          * cache the result in device-local VRAM (COMPASS 2.1), dispatch the
          * dp4a kernel with batched submit (3.1). */
-        if (in_dim % 32u || out_dim * (in_dim / 32u) == 0) return VG_E_UNSUPPORTED;
+        if (in_dim % 32u || out_dim * (in_dim / 32u) == 0) { MMDBG("q8-align"); return VG_E_UNSUPPORTED; }
         uint32_t nb = out_dim * (in_dim / 32u);
         VG_VKBuffer *wb = NULL, *sb = NULL;
         VG_Status st;
@@ -1247,15 +1282,48 @@ static VG_Status vk_matmul(VG_ModelGraph *g, uint32_t ggml_type, const void *wda
     if (ggml_type == 12) {
         /* Q4_K: upload the raw 144-byte blocks once (keyed by the stable mmap
          * data pointer) and run the on-disk-layout matvec kernel. */
-        if (in_dim % 256u) return VG_E_UNSUPPORTED;
+        if (in_dim % 256u) { MMDBG("q4k-align"); return VG_E_UNSUPPORTED; }
         VG_VKBuffer *wb = NULL;
         if (vg_vk_cache_get(g->vk, wdata, 0, &wb) != VG_OK) {
             VG_Status st = vg_vk_cache_acquire(g->vk, wdata, 0, wdata, wbytes, &wb);
-            if (st != VG_OK) return st;
+            if (st != VG_OK) { MMDBG("q4k-acquire"); return st; }
         }
-        return vg_vk_matvec_q4_k(g->vk, wb, x, y, out_dim, in_dim, out_dim);
+        VG_Status r = vg_vk_matvec_q4_k(g->vk, wb, x, y, out_dim, in_dim, out_dim);
+        MMDBG("q4k");
+        return r;
     }
 
+    if (ggml_type == 14) {
+        /* Q6_K: same raw-block scheme as Q4_K, 210-byte blocks. */
+        if (in_dim % 256u) { MMDBG("q6k-align"); return VG_E_UNSUPPORTED; }
+        VG_VKBuffer *wb = NULL;
+        if (vg_vk_cache_get(g->vk, wdata, 0, &wb) != VG_OK) {
+            VG_Status st;
+            if (wbytes & 3u) {
+                /* 210 B/block => the total weight size is not necessarily a
+                 * multiple of 4. matvec_q6_k reads the final byte as a full u32
+                 * word (w[(bbase+209)>>2]), which would over-read the storage
+                 * buffer range. Zero-pad the tail to a 4-byte multiple so that
+                 * last word is defined and in-bounds. Q4_K needs no pad (144
+                 * B/block is always 4-aligned). */
+                void *pad = malloc((wbytes + 3u) & ~(size_t)3u);
+                if (!pad) return VG_E_NOMEM;
+                size_t padded = (wbytes + 3u) & ~(size_t)3u;
+                memcpy(pad, wdata, wbytes);
+                memset((unsigned char *)pad + wbytes, 0, padded - wbytes);
+                st = vg_vk_cache_acquire(g->vk, wdata, 0, pad, padded, &wb);
+                free(pad);
+            } else {
+                st = vg_vk_cache_acquire(g->vk, wdata, 0, wdata, wbytes, &wb);
+            }
+            if (st != VG_OK) { MMDBG("q6k-acquire"); return st; }
+        }
+        VG_Status r = vg_vk_matvec_q6_k(g->vk, wb, x, y, out_dim, in_dim, out_dim);
+        MMDBG("q6k");
+        return r;
+    }
+
+    MMDBG("no-kernel");
     return VG_E_UNSUPPORTED;
 }
 

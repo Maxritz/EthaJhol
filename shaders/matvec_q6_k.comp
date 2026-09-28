@@ -1,0 +1,92 @@
+#version 450
+// Q6_K matvec (GGML type 14), reading the on-disk block layout DIRECTLY:
+// block_q6_K = { uint8 ql[128]; uint8 qh[64]; int8 scales[16]; fp16 d }
+// = 210 bytes per 256 weights.
+//   per 128-value half: bytes ql[half*64 .. +64), qh[half*32 .. +32), scales[half*8 .. +8)
+//   val(half, l, sub) = ((ql[half*64 + l + (sub&1)*32] >> ((sub&2)?4:0)) & 0xF)
+//                       | (((qh[half*32 + l] >> (sub*2)) & 3) << 4), then - 32
+//   scale = scales[half*8 + (l>>4) + sub*2]; w = d * scale * val ; x-offset = half*128 + sub*32 + l
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer W { uint w[]; };   // raw Q6_K bytes
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Params { uint out_dim; uint in_dim; } p;
+
+shared uint  sblk[8][54];   // 216 bytes, covers the 210-byte block
+shared float red[8][32];
+
+float decode_f16(uint h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mantissa = h & 0x3ffu;
+    uint f;
+    if (exp == 0u) {
+        if (mantissa == 0u) { f = sign << 31u; }
+        else {
+            int e = -1; uint m = mantissa;
+            do { m <<= 1u; ++e; } while ((m & 0x400u) == 0u);
+            m &= 0x3ffu;
+            f = (sign << 31u) | (uint(127 - 15 - e) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
+    else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
+    return uintBitsToFloat(f);
+}
+
+uint pb(uint gi, uint i) { return (sblk[gi][i >> 2u] >> ((i & 3u) * 8u)) & 0xFFu; }
+
+int sbyte(uint gi, uint i) {
+    int v = int(pb(gi, i));
+    return (v < 128) ? v : v - 256;
+}
+
+void main() {
+    uint gi   = gl_LocalInvocationID.x >> 5u;
+    uint lane = gl_LocalInvocationID.x & 31u;
+    uint row  = gl_WorkGroupID.x * 8u + gi;
+    uint nblk = p.in_dim / 256u;
+    uint row_bytes = nblk * 210u;
+    uint base = row * row_bytes;
+    bool valid = (row < p.out_dim);
+
+    float acc = 0.0;
+    for (uint mb = 0u; mb < nblk; ++mb) {
+        uint bbase = base + mb * 210u;
+        if (valid) {
+            for (uint j = lane; j < 210u; j += 32u) {
+                uint word = w[(bbase + j) >> 2u];
+                uint src_sh = ((bbase + j) & 3u) * 8u;
+                uint dst_sh = (j & 3u) * 8u;
+                atomicAnd(sblk[gi][j >> 2u], ~(0xFFu << dst_sh));
+                atomicOr (sblk[gi][j >> 2u], ((word >> src_sh) & 0xFFu) << dst_sh);
+            }
+        }
+        barrier();
+        if (valid) {
+            float d = decode_f16(pb(gi, 208u) | (pb(gi, 209u) << 8u));
+            for (uint hp = 0u; hp < 2u; ++hp) {
+                for (uint sub = 0u; sub < 4u; ++sub) {
+                    uint ql_idx  = hp * 64u + lane + (sub & 1u) * 32u;
+                    uint qh_idx  = hp * 32u + lane;
+                    uint nibshift = ((sub & 2u) != 0u) ? 4u : 0u;
+                    int qlbeta = int((pb(gi, ql_idx) >> nibshift) & 0xFu);
+                    int hi     = int((pb(gi, 128u + qh_idx) >> (sub * 2u)) & 3u);
+                    int val    = (qlbeta | (hi << 4)) - 32;
+                    int sc     = sbyte(gi, 192u + hp * 8u + (lane >> 4u) + sub * 2u);
+                    acc += d * float(sc) * float(val)
+                         * x[mb * 256u + hp * 128u + sub * 32u + lane];
+                }
+            }
+        }
+        barrier();
+    }
+
+    red[gi][lane] = acc;
+    barrier();
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) red[gi][lane] += red[gi][lane + s];
+        barrier();
+    }
+    if (lane == 0u && valid) y[row] = red[gi][0];
+}
