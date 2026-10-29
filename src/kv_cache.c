@@ -111,21 +111,25 @@ void vg_kv_close(VG_KVStore *s) { if (!s) return; for (size_t i = 0; i < s->page
 VG_Status vg_kv_sequence_init(VG_KVStore *s, VG_KVSequence **out) { if (!s || !out) return VG_E_INVALID; VG_KVSequence *q = (VG_KVSequence *)calloc(1, sizeof(*q)); if (!q) return VG_E_NOMEM; q->store = s; *out = q; return VG_OK; }
 void vg_kv_sequence_close(VG_KVSequence *q) { if (!q) return; for (size_t i = 0; i < q->page_count; ++i) page_drop(q->pages[i]); free(q->pages); free(q->tokens); free(q); }
 static VG_Status seq_reserve(VG_KVSequence *q, size_t n) {
-    if (n <= q->capacity) return VG_OK; size_t c = q->capacity ? q->capacity * 2u : 256u; while (c < n) { if (c > SIZE_MAX / 2u) return VG_E_RANGE; c *= 2u; }
+    if (n <= q->capacity) return VG_OK;
+    size_t c = q->capacity ? q->capacity * 2u : 256u; while (c < n) { if (c > SIZE_MAX / 2u) return VG_E_RANGE; c *= 2u; }
     uint64_t *p = (uint64_t *)realloc(q->tokens, c * sizeof(*p)); if (!p) return VG_E_NOMEM; q->tokens = p; q->capacity = c; return VG_OK;
 }
 static VG_Status pages_reserve(VG_KVSequence *q, size_t n) {
-    if (n <= q->page_capacity) return VG_OK; size_t c = q->page_capacity ? q->page_capacity * 2u : 16u; while (c < n) { if (c > SIZE_MAX / 2u) return VG_E_RANGE; c *= 2u; }
+    if (n <= q->page_capacity) return VG_OK;
+    size_t c = q->page_capacity ? q->page_capacity * 2u : 16u; while (c < n) { if (c > SIZE_MAX / 2u) return VG_E_RANGE; c *= 2u; }
     VG_Page **p = (VG_Page **)realloc(q->pages, c * sizeof(*p)); if (!p) return VG_E_NOMEM; q->pages = p; q->page_capacity = c; return VG_OK;
 }
 VG_Status vg_kv_sequence_append(VG_KVSequence *q, uint64_t token) {
-    if (!q) return VG_E_INVALID; VG_Status st = seq_reserve(q, q->length + 1u); if (st != VG_OK) return st;
+    if (!q) return VG_E_INVALID;
+    VG_Status st = seq_reserve(q, q->length + 1u); if (st != VG_OK) return st;
     size_t page_tokens = q->store->cfg.page_tokens; size_t pi = q->length / page_tokens;
     if (pi >= q->page_count) { if (q->page_count >= q->store->cfg.max_pages) return VG_E_RANGE; st = pages_reserve(q, pi + 1u); if (st != VG_OK) return st; VG_Page *p = new_page(q->store, VG_TIER_HOST); if (!p) return VG_E_NOMEM; q->pages[q->page_count++] = p; }
     q->tokens[q->length++] = token; return VG_OK;
 }
 VG_Status vg_kv_sequence_fork(VG_KVSequence *src, size_t prefix, VG_KVSequence **out) {
-    if (!src || !out || prefix > src->length) return VG_E_INVALID; VG_KVSequence *q; VG_Status st = vg_kv_sequence_init(src->store, &q); if (st != VG_OK) return st;
+    if (!src || !out || prefix > src->length) return VG_E_INVALID;
+    VG_KVSequence *q; VG_Status st = vg_kv_sequence_init(src->store, &q); if (st != VG_OK) return st;
     st = seq_reserve(q, prefix); if (st == VG_OK && prefix) memcpy(q->tokens, src->tokens, prefix * sizeof(*q->tokens)); q->length = prefix;
     size_t np = (prefix + src->store->cfg.page_tokens - 1u) / src->store->cfg.page_tokens;
     if (st == VG_OK) st = pages_reserve(q, np);
@@ -135,7 +139,8 @@ VG_Status vg_kv_sequence_fork(VG_KVSequence *src, size_t prefix, VG_KVSequence *
 size_t vg_kv_sequence_length(const VG_KVSequence *q) { return q ? q->length : 0; }
 const uint64_t *vg_kv_sequence_tokens(const VG_KVSequence *q) { return q ? q->tokens : NULL; }
 VG_Status vg_kv_page_acquire(VG_KVSequence *q, uint32_t layer, size_t token, VG_Tier desired, void **data, size_t *bytes) {
-    if (!q || !data || !bytes || layer >= q->store->cfg.n_layers || token >= q->length) return VG_E_INVALID; size_t pi = token / q->store->cfg.page_tokens; VG_Page *p = q->pages[pi];
+    if (!q || !data || !bytes || layer >= q->store->cfg.n_layers || token >= q->length) return VG_E_INVALID;
+    size_t pi = token / q->store->cfg.page_tokens; VG_Page *p = q->pages[pi];
     if (p->spilled && !fault_page(q->store, p)) return VG_E_IO;
     size_t layer_bytes = (size_t)q->store->cfg.kv_heads * q->store->cfg.head_dim * q->store->cfg.element_bytes * q->store->cfg.page_tokens; p->age = ++q->store->clock; p->tier = desired; *data = (unsigned char *)p->data + (size_t)layer * layer_bytes; *bytes = layer_bytes; ++q->store->stats.page_hits;
     vg_trace_emit("kv_page_hit", 0, 0, layer_bytes, 0);
@@ -154,7 +159,8 @@ static size_t common(const uint64_t *a, size_t an, const uint64_t *b, size_t bn)
 static VG_RadixNode *child_find(VG_RadixNode *n, uint64_t token) { for (size_t i = 0; i < n->nchild; ++i) if (n->child[i]->count && n->child[i]->tokens[0] == token) return n->child[i]; return NULL; }
 static VG_Status child_add(VG_RadixNode *n, VG_RadixNode *child) { if (n->nchild == n->cchild) { size_t c = n->cchild ? n->cchild * 2u : 4u; VG_RadixNode **p = (VG_RadixNode **)realloc(n->child, c * sizeof(*p)); if (!p) return VG_E_NOMEM; n->child = p; n->cchild = c; } n->child[n->nchild++] = child; return VG_OK; }
 VG_Status vg_radix_lookup(VG_Radix *r, const uint64_t *tokens, size_t count, size_t *matched, VG_KVSequence **snapshot) {
-    if (!r || (!tokens && count) || !matched || !snapshot) return VG_E_INVALID; *matched = 0; *snapshot = NULL; ++r->store->stats.prefix_lookups; VG_RadixNode *n = r->root; size_t pos = 0; VG_RadixNode *best = NULL; size_t best_pos = 0;
+    if (!r || (!tokens && count) || !matched || !snapshot) return VG_E_INVALID;
+    *matched = 0; *snapshot = NULL; ++r->store->stats.prefix_lookups; VG_RadixNode *n = r->root; size_t pos = 0; VG_RadixNode *best = NULL; size_t best_pos = 0;
     while (pos < count) { VG_RadixNode *c = child_find(n, tokens[pos]); if (!c) break; size_t k = common(tokens + pos, count - pos, c->tokens, c->count); if (k != c->count) break; pos += k; n = c; if (n->snapshot && !n->tainted) { best = n; best_pos = pos; } }
     if (best) { *matched = best_pos; *snapshot = best->snapshot; ++r->store->stats.prefix_hits; r->store->stats.prefix_tokens_reused += *matched;
         vg_trace_emit("radix_hit", 0, 0, *matched * sizeof(uint64_t), 1);
@@ -162,9 +168,11 @@ VG_Status vg_radix_lookup(VG_Radix *r, const uint64_t *tokens, size_t count, siz
     return VG_OK;
 }
 VG_Status vg_radix_insert(VG_Radix *r, VG_KVSequence *seq, size_t token_count, uint64_t fp, int tainted) {
-    if (!r || !seq || token_count > seq->length) return VG_E_INVALID; VG_RadixNode *n = r->root; size_t pos = 0;
+    if (!r || !seq || token_count > seq->length) return VG_E_INVALID;
+    VG_RadixNode *n = r->root; size_t pos = 0;
     while (pos < token_count) { VG_RadixNode *c = child_find(n, seq->tokens[pos]); if (!c) { c = node_new(seq->tokens + pos, token_count - pos); if (!c) return VG_E_NOMEM; if (child_add(n, c) != VG_OK) { node_free(c); return VG_E_NOMEM; } n = c; pos = token_count; break; } size_t k = common(seq->tokens + pos, token_count - pos, c->tokens, c->count); if (k < c->count) { /* split the edge */ VG_RadixNode *tail = node_new(c->tokens + k, c->count - k); if (!tail) return VG_E_NOMEM; tail->snapshot = c->snapshot; tail->semantic_fingerprint = c->semantic_fingerprint; tail->tainted = c->tainted; c->snapshot = NULL; c->semantic_fingerprint = 0; c->tainted = 0; for (size_t j = 0; j < c->nchild; ++j) (void)child_add(tail, c->child[j]); free(c->child); c->child = NULL; c->nchild = c->cchild = 0; c->tokens[k] = 0; c->count = k; if (child_add(c, tail) != VG_OK) { node_free(tail); return VG_E_NOMEM; } if (k == token_count - pos) { n = c; pos = token_count; break; } VG_RadixNode *leaf = node_new(seq->tokens + pos + k, token_count - pos - k); if (!leaf || child_add(c, leaf) != VG_OK) { node_free(leaf); return VG_E_NOMEM; } n = leaf; pos = token_count; break; } pos += k; n = c; }
-    if (n->snapshot) vg_kv_sequence_close(n->snapshot); VG_Status st = vg_kv_sequence_fork(seq, token_count, &n->snapshot); if (st != VG_OK) return st; n->semantic_fingerprint = fp; n->tainted = tainted != 0; return VG_OK;
+    if (n->snapshot) vg_kv_sequence_close(n->snapshot);
+    VG_Status st = vg_kv_sequence_fork(seq, token_count, &n->snapshot); if (st != VG_OK) return st; n->semantic_fingerprint = fp; n->tainted = tainted != 0; return VG_OK;
 }
 void vg_radix_invalidate(VG_Radix *r, uint64_t model_identity, uint64_t adapter_identity) { (void)model_identity; (void)adapter_identity; if (!r) return; node_invalidate_all(r->root); }
 void vg_kv_stats(const VG_KVStore *sc, VG_KVStats *out) { if (sc && out) *out = sc->stats; }

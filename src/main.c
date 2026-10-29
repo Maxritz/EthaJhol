@@ -2,6 +2,8 @@
 #include "vg/tensor_source.h"
 #include "vg/tokenizer.h"
 #include "vg/model_graph.h"
+#include "vg/model_probe.h"
+#include "vg/cpu_ops.h"
 #ifdef VG_BUILD_FULL_ENGINE
 #include "vg/full_engine.h"
 #endif
@@ -68,7 +70,8 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
                 cum += probs[idx[i]];
                 if (cum >= top_p) { cutoff = i + 1; break; }
             }
-            for (uint32_t i = cutoff; i < n_vocab; ++i) probs[idx[i]] = 0.0f; free(idx);
+            for (uint32_t i = cutoff; i < n_vocab; ++i) probs[idx[i]] = 0.0f;
+            free(idx);
             s = 0.0f; for (uint32_t i = 0; i < n_vocab; ++i) s += probs[i];
             if (s > 0.0f) for (uint32_t i = 0; i < n_vocab; ++i) probs[i] /= s;
         }
@@ -96,23 +99,35 @@ static int plugin_info(const char *path) {
     const VG_Plugin *p = vg_plugin(h); printf("plugin: %s %s\nkind: %u\ndescription: %s\n", p->info.name, p->info.version, (unsigned)p->info.kind, p->info.description); vg_plugin_unload(h); return 0;
 }
 #ifdef VG_HAS_VULKAN
-static const char *shader_dir(void) { FILE *f = fopen("shaders/matvec_i8.comp.spv", "rb"); if (f) { fclose(f); return "shaders"; } f = fopen("build/shaders/matvec_i8.comp.spv", "rb"); if (f) { fclose(f); return "build/shaders"; } return "shaders"; }
+static const char *shader_dir(void) { FILE *f = fopen("shaders/matvec_q4_0.comp.spv", "rb"); if (f) { fclose(f); return "shaders"; } f = fopen("build/shaders/matvec_q4_0.comp.spv", "rb"); if (f) { fclose(f); return "build/shaders"; } return "shaders"; }
 static int vk_self_test(void) {
     VG_VK *v = NULL; VG_VKConfig cfg; memset(&cfg, 0, sizeof(cfg)); cfg.device_index = UINT32_MAX; cfg.shader_dir = shader_dir();
     VG_Status st = vg_vk_open(&cfg, &v); if (st != VG_OK) { fprintf(stderr, "Vulkan unavailable: %s\n", status_name(st)); return 2; }
-    const int8_t w[8] = {1, 2, 3, 4, -1, -2, -3, -4}; const float scales[2] = {1.0f, 0.5f}; const float x[4] = {1, 1, 1, 1}; float y[2] = {0, 0}; VG_VKBuffer *wb = NULL, *sb = NULL;
-    st = vg_vk_buffer_upload(v, w, sizeof(w), &wb); if (st == VG_OK) st = vg_vk_buffer_upload(v, scales, sizeof(scales), &sb); if (st == VG_OK) st = vg_vk_matvec_i8(v, wb, sb, x, y, 1, 4, 2);
-    printf("vulkan self-test: status=%s y=[%.3f, %.3f]\n", status_name(st), y[0], y[1]); int ok = st == VG_OK && y[0] > 9.99f && y[0] < 10.01f && y[1] > -5.01f && y[1] < -4.99f;
-    vg_vk_buffer_release(v, wb); vg_vk_buffer_release(v, sb); vg_vk_close(v); return ok ? 0 : 2;
+    /* Two Q4_0 rows, in_dim=32: d=1.0 and every nibble = 9 -> each weight is +1. */
+    unsigned char w[2 * 18]; memset(w, 0x99, sizeof(w));
+    w[0] = 0x00; w[1] = 0x3c; w[18] = 0x00; w[19] = 0x3c;
+    float x[32]; for (int i = 0; i < 32; ++i) x[i] = 1.0f;
+    float y[2] = {0.0f, 0.0f};
+    st = vg_vk_matvec_q4_0(v, w, x, y, 2, 32);
+    printf("vulkan self-test: status=%s y=[%.3f, %.3f]\n", status_name(st), y[0], y[1]);
+    int ok = st == VG_OK && fabsf(y[0] - 32.0f) < 0.1f && fabsf(y[1] - 32.0f) < 0.1f;
+    vg_vk_close(v);
+    return ok ? 0 : 2;
 }
 static int vk_info(void) {
     VG_VK *v = NULL; VG_VKConfig cfg; memset(&cfg, 0, sizeof(cfg)); cfg.device_index = UINT32_MAX; cfg.shader_dir = shader_dir(); cfg.prefer_discrete = 1; VG_Status st = vg_vk_open(&cfg, &v); if (st != VG_OK) { fprintf(stderr, "Vulkan unavailable: %s\n", status_name(st)); return 2; }
     VG_VKInfo i; vg_vk_info(v, &i); printf("Vulkan: %s\nAPI: %u.%u.%u\nlocal heap: %.2f GiB\n", i.name, VK_VERSION_MAJOR(i.api_version), VK_VERSION_MINOR(i.api_version), VK_VERSION_PATCH(i.api_version), (double)i.device_local_bytes / (1024.0 * 1024.0 * 1024.0)); vg_vk_close(v); return 0;
 }
+#endif
+
+#ifdef VG_BUILD_FULL_ENGINE
 static int cpu_infer(const char *path, const char *prompt) {
     fprintf(stderr, "CPU native inference: %s\n", path);
     VG_GGUF *g = NULL; VG_Status st = vg_gguf_open(path, &g);
     if (st != VG_OK) { fprintf(stderr, "open failed: %s\n", status_name(st)); return 2; }
+    { VG_ModelProbe p; vg_model_probe(g, &p);
+      if (!p.ok) { fprintf(stderr, "model not supported: %s\n", p.detail); vg_gguf_close(g); return 3; }
+      fprintf(stderr, "cpu threads: %d\n", vg_cpu_set_threads(0)); }
     VG_TensorSourceConfig sc; memset(&sc, 0, sizeof(sc)); sc.host_budget_bytes = 256u * 1024u * 1024u; sc.io_chunk_bytes = 4u * 1024u * 1024u; sc.use_mmap = 1;
     VG_TensorSource *src = NULL; st = vg_tensor_source_open(g, &sc, &src);
     if (st != VG_OK) { fprintf(stderr, "tensor source failed: %s\n", status_name(st)); vg_gguf_close(g); return 2; }
@@ -171,6 +186,7 @@ static int cpu_infer(const char *path, const char *prompt) {
     return 0;
 }
 
+#ifdef VG_HAS_VULKAN
 static int vk_infer(const char *path, const char *prompt) {
     fprintf(stderr, "Vulkan native inference: %s\n", path);
     VG_GGUF *g = NULL; VG_Status st = vg_gguf_open(path, &g);
@@ -238,7 +254,120 @@ static int vk_infer(const char *path, const char *prompt) {
     free(logits); free(tokens); vg_tokenizer_free(tok); vg_vk_close(v); vg_model_graph_free(graph); vg_tensor_source_close(src); vg_gguf_close(g);
     return 0;
 }
+#endif /* VG_HAS_VULKAN */
+#endif /* VG_BUILD_FULL_ENGINE */
+
+#ifdef VG_BUILD_FULL_ENGINE
+#include "vg/speculative.h"
+
+/* Load one model into a graph. Returns NULL and prints the reason on failure. */
+static VG_ModelGraph *spec_open_graph(const char *path, VG_GGUF **gguf_out, VG_TensorSource **src_out) {
+    VG_GGUF *file = NULL;
+    if (vg_gguf_open(path, &file) != VG_OK) { fprintf(stderr, "%s: cannot open\n", path); return NULL; }
+    VG_ModelProbe probe;
+    vg_model_probe(file, &probe);
+    if (!probe.ok) {
+        fprintf(stderr, "%s: model not supported: %s\n", path, probe.detail);
+        vg_gguf_close(file);
+        return NULL;
+    }
+    VG_TensorSourceConfig scfg;
+    memset(&scfg, 0, sizeof(scfg));
+    scfg.host_budget_bytes = 256u * 1024u * 1024u;
+    scfg.io_chunk_bytes = 4u * 1024u * 1024u;
+    scfg.use_mmap = 1;
+    VG_TensorSource *src = NULL;
+    if (vg_tensor_source_open(file, &scfg, &src) != VG_OK) { vg_gguf_close(file); return NULL; }
+    VG_ModelGraph *g = NULL;
+    if (vg_model_graph_load(file, src, &g) != VG_OK) {
+        vg_tensor_source_close(src); vg_gguf_close(file);
+        fprintf(stderr, "%s: graph load failed\n", path);
+        return NULL;
+    }
+    *gguf_out = file;
+    *src_out = src;
+    return g;
+}
+
+/* Speculative decoding smoke driver: DRAFT may be omitted, in which case the target doubles
+ * as its own draft (every proposal is then accepted, which exercises the acceptance path
+ * without proving any speedup). */
+static int spec_cmd(const char *target_path, const char *draft_path, int32_t n_tokens) {
+    VG_GGUF *tf = NULL, *df = NULL;
+    VG_TensorSource *ts = NULL, *ds = NULL;
+    VG_ModelGraph *target = spec_open_graph(target_path, &tf, &ts);
+    if (!target) return 2;
+    const int self_draft = (draft_path == NULL) || (strcmp(draft_path, target_path) == 0);
+    VG_ModelGraph *draft = self_draft ? target : spec_open_graph(draft_path, &df, &ds);
+    if (!draft) { vg_model_graph_free(target); vg_tensor_source_close(ts); vg_gguf_close(tf); return 2; }
+
+    const VG_ModelConfig *mc = vg_model_graph_config(target);
+    VG_Tokenizer *tok = NULL;
+    if (vg_tokenizer_load(tf, &tok) != VG_OK) tok = NULL;
+
+    VG_SpeculativeConfig cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.draft_graph = draft;
+    cfg.target_graph = target;
+    cfg.n_draft = 4;
+    cfg.temperature = 0.0f;   /* greedy: the accepted stream must match plain decoding */
+    uint32_t rng = 12345u;
+    cfg.rng = &rng;
+
+    vg_model_graph_reset(target);
+    if (!self_draft) vg_model_graph_reset(draft);
+
+    int32_t accepted[8];
+    int32_t pos = 0;
+    int32_t token = mc->bos_id;
+    int32_t emitted = 0, accepted_total = 0, proposals_total = 0;
+    while (emitted < n_tokens && pos + cfg.n_draft + 1 < (int32_t)mc->n_ctx) {
+        const int32_t n = vg_speculative_step(&cfg, token, pos, accepted, (int32_t)(sizeof(accepted) / sizeof(accepted[0])));
+        if (n <= 0) { fprintf(stderr, "speculative step failed at pos %d\n", pos); break; }
+        accepted_total += n;
+        proposals_total += cfg.n_draft;
+        for (int32_t i = 0; i < n && emitted < n_tokens; ++i) {
+            char piece[128];
+            const size_t len = tok ? vg_tokenizer_decode(tok, accepted[i], piece, sizeof(piece)) : 0;
+            if (len) fwrite(piece, 1, len, stdout);
+            if (accepted[i] == mc->eos_id) { emitted = n_tokens; break; }
+            ++emitted;
+        }
+        token = accepted[n - 1];
+        pos += n;
+    }
+    fputc('\n', stdout);
+    fprintf(stderr, "speculative: emitted=%d accepted=%d proposed=%d (%.0f%% acceptance, draft=%s)\n",
+            emitted, accepted_total, proposals_total,
+            proposals_total ? 100.0 * (double)accepted_total / (double)proposals_total : 0.0,
+            self_draft ? "self" : "separate");
+    if (tok) vg_tokenizer_free(tok);
+    vg_model_graph_free(target);
+    vg_tensor_source_close(ts);
+    vg_gguf_close(tf);
+    if (!self_draft) {
+        vg_model_graph_free(draft);
+        vg_tensor_source_close(ds);
+        vg_gguf_close(df);
+    }
+    return 0;
+}
 #endif
+
+static int probe_cmd(const char *path) {
+    VG_GGUF *g = NULL;
+    VG_Status st = vg_gguf_open(path, &g);
+    if (st != VG_OK) { fprintf(stderr, "open failed: %s\n", status_name(st)); return 2; }
+    VG_ModelProbe probe;
+    st = vg_model_probe(g, &probe);
+    char report[2048];
+    vg_model_probe_report(&probe, report, sizeof(report));
+    printf("%s\n", report);
+    vg_gguf_close(g);
+    if (st != VG_OK) return 2;
+    return probe.ok ? 0 : 3;
+}
+
 static int tokenize_cmd(const char *path, const char *text) {
     VG_GGUF *g = NULL; VG_Status st = vg_gguf_open(path, &g); if (st != VG_OK) { fprintf(stderr, "open failed: %s\n", status_name(st)); return 2; }
     VG_Tokenizer *tok = NULL; st = vg_tokenizer_load(g, &tok); if (st != VG_OK) { fprintf(stderr, "tokenizer load failed: %s\n", status_name(st)); vg_gguf_close(g); return 2; }
@@ -378,10 +507,28 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "--vulkan-self-test") == 0) return vk_self_test();
     if (argc == 3 && strcmp(argv[1], "--vulkan-infer") == 0) return vk_infer(argv[2], NULL);
     if (argc == 4 && strcmp(argv[1], "--vulkan-infer") == 0) return vk_infer(argv[2], argv[3]);
+#else
+    /* Built against the no-Vulkan stub: say why instead of printing the generic usage line. */
+    if (argc == 2 && (strcmp(argv[1], "--vulkan-info") == 0 || strcmp(argv[1], "--vulkan-self-test") == 0)) {
+        fprintf(stderr, "%s: this build has no Vulkan backend (no Vulkan SDK was found at configure time)\n"
+                        "install the Vulkan SDK and reconfigure with -DVG_ENABLE_VULKAN=ON, then rebuild\n", argv[1]);
+        return 3;
+    }
 #endif
+#ifdef VG_BUILD_FULL_ENGINE
     if (argc == 3 && strcmp(argv[1], "--cpu-infer") == 0) return cpu_infer(argv[2], NULL);
     if (argc == 4 && strcmp(argv[1], "--cpu-infer") == 0) return cpu_infer(argv[2], argv[3]);
+#endif
+    if (argc == 3 && strcmp(argv[1], "probe") == 0) return probe_cmd(argv[2]);
     if (argc == 3 && strcmp(argv[1], "plugin-info") == 0) return plugin_info(argv[2]);
+#ifdef VG_BUILD_FULL_ENGINE
+    if (argc >= 3 && strcmp(argv[1], "spec") == 0) {
+        const char *draft = argc > 3 && argv[3][0] ? argv[3] : NULL;
+        int32_t n = argc > 4 ? (int32_t)strtol(argv[4], NULL, 10) : 16;
+        if (n <= 0 || n > 512) n = 16;
+        return spec_cmd(argv[2], draft, n);
+    }
+#endif
     if (argc == 3 && strcmp(argv[1], "inspect") == 0) return inspect(argv[2]);
     if (argc == 3 && strcmp(argv[1], "diagnostics") == 0) return diagnostics(argv[2]);
     if (argc == 4 && strcmp(argv[1], "tokenize") == 0) return tokenize_cmd(argv[2], argv[3]);
@@ -390,6 +537,7 @@ int main(int argc, char **argv) {
 #ifdef VG_BUILD_FULL_ENGINE
     if (argc >= 3 && strcmp(argv[1], "chat") == 0) { const char *sys = argc > 3 ? argv[3] : ""; return chat_mode(argv[2], sys); }
 #endif
+
     if (argc == 4 && strcmp(argv[1], "stream") == 0) { VG_GGUF *g = NULL; VG_Status st = vg_gguf_open(argv[2], &g); if (st != VG_OK) { fprintf(stderr, "open failed: %s\n", status_name(st)); return 2; } VG_TensorSource *s = NULL; VG_TensorSourceConfig c; memset(&c, 0, sizeof(c)); c.io_chunk_bytes = 4u * 1024u * 1024u; c.use_mmap = 0; st = vg_tensor_source_open(g, &c, &s); uint64_t total = 0; if (st == VG_OK) st = vg_tensor_stream(s, argv[3], c.io_chunk_bytes, count_chunk, &total); printf("streamed=%" PRIu64 " status=%s\n", total, status_name(st)); vg_tensor_source_close(s); vg_gguf_close(g); return st == VG_OK ? 0 : 2; }
-    fprintf(stderr, "usage: %s --vulkan-info | --vulkan-self-test | --vulkan-infer MODEL.gguf [PROMPT] | inspect MODEL.gguf | diagnostics MODEL.gguf | tokenize MODEL.gguf TEXT | stream MODEL.gguf TENSOR | plugin-info PLUGIN\n", argv[0]); return 1;
+    fprintf(stderr, "usage: %s --vulkan-info | --vulkan-self-test | --vulkan-infer MODEL.gguf [PROMPT] | inspect MODEL.gguf | diagnostics MODEL.gguf | tokenize MODEL.gguf TEXT | stream MODEL.gguf TENSOR | plugin-info PLUGIN | probe MODEL.gguf | logits MODEL.gguf [PROMPT] | spec MODEL.gguf [DRAFT.gguf] [N]\n", argv[0]); return 1;
 }

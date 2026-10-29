@@ -1,56 +1,33 @@
 #version 450
+/* Numerically stable softmax over one vector of arbitrary length. */
 
 layout(local_size_x = 256) in;
+
 layout(std430, binding = 0) buffer Data { float x[]; };
 layout(push_constant) uniform Params { uint dim; } p;
 
-shared float partial_max[256];
-shared float partial_sum[256];
+shared float partial[256];
 
 void main() {
-    uint lid = gl_LocalInvocationID.x;
-    uint gid = gl_GlobalInvocationID.x;
-    uint row = gid / p.dim;
-    uint col = gid % p.dim;
-    uint base = row * p.dim;
-
-    float val = (col < p.dim) ? x[base + col] : -1e30;
-    partial_max[lid] = val;
+    uint lane = gl_LocalInvocationID.x;
+    float mx = -3.402823466e+38;
+    for (uint i = lane; i < p.dim; i += 256u) mx = max(mx, x[i]);
+    partial[lane] = mx;
     barrier();
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (lid < stride) {
-            partial_max[lid] = max(partial_max[lid], partial_max[lid + stride]);
-        }
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) partial[lane] = max(partial[lane], partial[lane + s]);
         barrier();
     }
-
-    float mx;
-    if (lid == 0u) mx = partial_max[0];
+    float m = partial[0];
     barrier();
-    if (lid == 0u) partial_max[0] = mx;
+    float sum = 0.0;
+    for (uint i = lane; i < p.dim; i += 256u) sum += exp(x[i] - m);
+    partial[lane] = sum;
     barrier();
-    mx = partial_max[0];
-
-    float ev = (col < p.dim) ? exp(val - mx) : 0.0;
-    partial_sum[lid] = ev;
-    barrier();
-
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
-        if (lid < stride) {
-            partial_sum[lid] += partial_sum[lid + stride];
-        }
+    for (uint s = 128u; s > 0u; s >>= 1u) {
+        if (lane < s) partial[lane] += partial[lane + s];
         barrier();
     }
-
-    float s;
-    if (lid == 0u) s = partial_sum[0];
-    barrier();
-    if (lid == 0u) partial_sum[0] = 1.0 / s;
-    barrier();
-    s = partial_sum[0];
-
-    if (col < p.dim) {
-        x[base + col] = ev * s;
-    }
+    float inv = 1.0 / partial[0];
+    for (uint i = lane; i < p.dim; i += 256u) x[i] = exp(x[i] - m) * inv;
 }

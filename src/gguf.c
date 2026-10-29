@@ -3,6 +3,7 @@
 #endif
 
 #include "vg/gguf.h"
+#include "vg/quant.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -98,7 +99,7 @@ static uint32_t fnv1a(const char *s) {
 }
 static VG_HashEntry *hash_find(VG_HashEntry *table, size_t cap, const char *key) {
     if (!cap) return NULL;
-    uint32_t i = fnv1a(key) % cap;
+    size_t i = (size_t)fnv1a(key) % cap;
     for (size_t probes = 0; probes < cap; ++probes) {
         VG_HashEntry *e = &table[i];
         if (!e->occupied) return e;
@@ -108,7 +109,11 @@ static VG_HashEntry *hash_find(VG_HashEntry *table, size_t cap, const char *key)
     return NULL;
 }
 static int hash_insert(VG_HashEntry **table, size_t *cap, const char *key, uint32_t index) {
-    if (*cap == 0) { *cap = 64; *table = (VG_HashEntry *)calloc(*cap, sizeof(VG_HashEntry)); if (!*table) return 0; }
+    if (*cap == 0) {
+        *cap = 64;
+        *table = (VG_HashEntry *)calloc(*cap, sizeof(VG_HashEntry));
+        if (!*table) return 0;
+    }
     size_t threshold = *cap * 3 / 4;
     size_t count = 0; for (size_t i = 0; i < *cap; ++i) if ((*table)[i].occupied) ++count;
     if (count >= threshold) {
@@ -189,45 +194,15 @@ static char *read_scalar_value(FILE *f, uint32_t type) {
         default: return NULL;
     }
 }
+/* Single source of truth: the quant table in quant.c. This used to be a second, hand-kept
+ * copy of ggml's block sizes, which had already drifted (Q1_0 was listed as 32 weights per
+ * 18-byte block instead of 128) and could not parse the ternary types at all. */
 static int quant_layout(uint32_t type, uint32_t *block, uint32_t *type_size) {
-    *block = 1; *type_size = 0;
-    switch (type) {
-        case 0: *type_size = 4; return 1;             /* F32 */
-        case 1: *type_size = 2; return 1;             /* F16 */
-        case 2: *block = 32; *type_size = 18; return 1; /* Q4_0 */
-        case 3: *block = 32; *type_size = 20; return 1; /* Q4_1 */
-        case 4: *type_size = 8; return 1;             /* F64 */
-        case 6: *block = 32; *type_size = 22; return 1; /* Q5_0 */
-        case 7: *block = 32; *type_size = 24; return 1; /* Q5_1 */
-        case 8: *block = 32; *type_size = 34; return 1; /* Q8_0 */
-        case 9: *block = 32; *type_size = 36; return 1; /* Q8_1 */
-        case 10: *block = 256; *type_size = 84; return 1; /* Q2_K */
-        case 11: *block = 256; *type_size = 110; return 1; /* Q3_K */
-        case 12: *block = 256; *type_size = 144; return 1; /* Q4_K */
-        case 13: *block = 256; *type_size = 176; return 1; /* Q5_K */
-        case 14: *block = 256; *type_size = 210; return 1; /* Q6_K */
-        case 15: *block = 256; *type_size = 292; return 1; /* Q8_K */
-        case 16: *block = 256; *type_size = 66; return 1;  /* IQ2_XXS */
-        case 17: *block = 256; *type_size = 74; return 1;  /* IQ2_XS */
-        case 18: *block = 256; *type_size = 98; return 1;  /* IQ3_XXS */
-        case 19: *block = 256; *type_size = 50; return 1;  /* IQ1_S */
-        case 20: *block = 32; *type_size = 18; return 1;   /* IQ4_NL */
-        case 21: *block = 256; *type_size = 110; return 1; /* IQ3_S */
-        case 22: *block = 256; *type_size = 82; return 1;  /* IQ2_S */
-        case 23: *block = 256; *type_size = 136; return 1; /* IQ4_XS */
-        case 24: *type_size = 1; return 1;             /* I8 */
-        case 25: *type_size = 2; return 1;             /* I16 */
-        case 26: *type_size = 4; return 1;             /* I32 */
-        case 27: *type_size = 8; return 1;             /* I64 */
-        case 28: *type_size = 8; return 1;             /* F64 (alt) */
-        case 29: *block = 256; *type_size = 56; return 1;  /* IQ1_M */
-        case 30: *type_size = 2; return 1;             /* BF16 */
-        case 39: *block = 32; *type_size = 17; return 1;   /* MXFP4 */
-        case 40: *block = 64; *type_size = 36; return 1;   /* NVFP4 */
-        case 41: *block = 32; *type_size = 18; return 1;   /* Q1_0 */
-        case 42: *block = 64; *type_size = 18; return 1;   /* Q2_0 */
-        default: return 0;
-    }
+    const VG_QuantInfo *qi = vg_quant_info(type);
+    if (!qi) { *block = 1; *type_size = 0; return 0; }
+    *block = qi->block_size;
+    *type_size = qi->bytes_per_block;
+    return 1;
 }
 static VG_Status parse_index(VG_GGUF *g) {
     uint32_t magic, version; uint64_t kv_count;
@@ -271,11 +246,13 @@ static VG_Status parse_index(VG_GGUF *g) {
     g->meta_hash = (VG_HashEntry *)calloc(g->meta_hash_cap, sizeof(VG_HashEntry));
     if (!g->meta_hash && g->meta_count) return VG_E_NOMEM;
     for (size_t i = 0; i < g->meta_count; ++i) hash_insert(&g->meta_hash, &g->meta_hash_cap, g->meta[i].key, (uint32_t)i);
-    (void)off; return VG_OK;
+    (void)off;
+    return VG_OK;
 }
 
 VG_Status vg_gguf_open(const char *path, VG_GGUF **out) {
-    if (!path || !out) return VG_E_INVALID; *out = NULL;
+    if (!path || !out) return VG_E_INVALID;
+    *out = NULL;
     FILE *f = fopen(path, "rb"); if (!f) return VG_E_IO;
     if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return VG_E_IO; }
     uint64_t size = tell64(f); if (size < 24 || !seek64(f, 0)) { fclose(f); return VG_E_FORMAT; }
@@ -290,7 +267,9 @@ VG_Status vg_gguf_open(const char *path, VG_GGUF **out) {
     *out = g; return VG_OK;
 }
 void vg_gguf_close(VG_GGUF *g) {
-    if (!g) return; vg_gguf_unmap(g); if (g->index) fclose(g->index);
+    if (!g) return;
+    vg_gguf_unmap(g);
+    if (g->index) fclose(g->index);
     for (uint64_t i = 0; i < g->tensor_count; ++i) free((void *)g->tensors[i].name);
     for (size_t i = 0; i < g->meta_count; ++i) { free(g->meta[i].key); free(g->meta[i].value); }
     free(g->tensors); free(g->meta); free(g->tensor_hash); free(g->meta_hash); free(g->path); free(g);
@@ -307,7 +286,10 @@ const VG_GGUF_Tensor *vg_gguf_find_tensor(const VG_GGUF *g, const char *name) {
         VG_HashEntry *e = hash_find(g->tensor_hash, g->tensor_hash_cap, name);
         if (e && e->occupied) return &g->tensors[e->index];
     }
-    for (uint64_t i = 0; i < g->tensor_count; ++i) if (strcmp(g->tensors[i].name, name) == 0) return &g->tensors[i]; return NULL;
+    for (uint64_t i = 0; i < g->tensor_count; ++i) {
+        if (strcmp(g->tensors[i].name, name) == 0) return &g->tensors[i];
+    }
+    return NULL;
 }
 const char *vg_gguf_meta(const VG_GGUF *g, const char *key) {
     if (!g || !key) return NULL;
@@ -315,11 +297,28 @@ const char *vg_gguf_meta(const VG_GGUF *g, const char *key) {
         VG_HashEntry *e = hash_find(g->meta_hash, g->meta_hash_cap, key);
         if (e && e->occupied) return g->meta[e->index].value;
     }
-    for (size_t i = 0; i < g->meta_count; ++i) if (strcmp(g->meta[i].key, key) == 0) return g->meta[i].value; return NULL;
+    for (size_t i = 0; i < g->meta_count; ++i) {
+        if (strcmp(g->meta[i].key, key) == 0) return g->meta[i].value;
+    }
+    return NULL;
 }
-VG_Status vg_gguf_read(const VG_GGUF *g, const VG_GGUF_Tensor *t, uint64_t off, void *dst, size_t n) {
-    if (!g || !t || !dst || off > t->nbytes || (uint64_t)n > t->nbytes - off) return VG_E_RANGE;
+VG_Status vg_gguf_read(const VG_GGUF *gc, const VG_GGUF_Tensor *t, uint64_t off, void *dst, size_t n) {
+    if (!gc || !t || !dst || off > t->nbytes || (uint64_t)n > t->nbytes - off) return VG_E_RANGE;
+    VG_GGUF *g = (VG_GGUF *)gc;
     uint64_t abs = g->data_base + t->data_offset + off;
+    /* Fast path: a read-only mapping turns every read into a memcpy from the page cache.
+     * The mapping is created on first use, so opening a model stays lazy. */
+    if (!g->map_base && g->file_size) {
+        /* Pass real const void* locals: handing vg_gguf_map() a void** made the signature
+         * mismatch, which is undefined behaviour even though the bits line up. */
+        const void *base = NULL;
+        uint64_t size = 0;
+        (void)vg_gguf_map(g, &base, &size);
+    }
+    if (g->map_base && abs <= g->map_size && n <= g->map_size - abs) {
+        memcpy(dst, (const unsigned char *)g->map_base + abs, n);
+        return VG_OK;
+    }
 #ifndef _WIN32
     if (g->direct_io) {
         int fd = open(g->path, O_RDONLY | O_DIRECT);
@@ -338,11 +337,17 @@ VG_Status vg_gguf_read(const VG_GGUF *g, const VG_GGUF_Tensor *t, uint64_t off, 
         return VG_OK;
     }
 #endif
-    FILE *f = fopen(g->path, "rb"); if (!f) return VG_E_IO;
-    VG_Status s = seek64(f, abs) && n == fread(dst, 1, n, f) ? VG_OK : VG_E_IO; fclose(f); return s;
+    /* Re-use the open index handle instead of opening/closing the file per read. */
+    FILE *f = g->index;
+    if (!f) { f = fopen(g->path, "rb"); if (!f) return VG_E_IO; }
+    VG_Status s = seek64(f, abs) && n == fread(dst, 1, n, f) ? VG_OK : VG_E_IO;
+    if (f != g->index) fclose(f);
+    return s;
 }
 VG_Status vg_gguf_map(const VG_GGUF *gc, const void **base, uint64_t *size) {
-    if (!gc || !base || !size) return VG_E_INVALID; VG_GGUF *g = (VG_GGUF *)gc; if (g->map_base) { *base = g->map_base; *size = g->map_size; return VG_OK; }
+    if (!gc || !base || !size) return VG_E_INVALID;
+    VG_GGUF *g = (VG_GGUF *)gc;
+    if (g->map_base) { *base = g->map_base; *size = g->map_size; return VG_OK; }
 #ifdef _WIN32
     HANDLE f = CreateFileA(g->path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL); if (f == INVALID_HANDLE_VALUE) return VG_E_IO;
     HANDLE m = CreateFileMappingA(f, NULL, PAGE_READONLY, 0, 0, NULL); if (!m) { CloseHandle(f); return VG_E_IO; }
@@ -354,7 +359,9 @@ VG_Status vg_gguf_map(const VG_GGUF *gc, const void **base, uint64_t *size) {
     g->map_base = p; g->map_size = g->file_size; *base = p; *size = g->file_size; return VG_OK;
 }
 void vg_gguf_unmap(const VG_GGUF *gc) {
-    if (!gc) return; VG_GGUF *g = (VG_GGUF *)gc; if (!g->map_base) return;
+    if (!gc) return;
+    VG_GGUF *g = (VG_GGUF *)gc;
+    if (!g->map_base) return;
 #ifdef _WIN32
     UnmapViewOfFile(g->map_base); CloseHandle(g->map_object); CloseHandle(g->map_file); g->map_object = NULL; g->map_file = INVALID_HANDLE_VALUE;
 #else

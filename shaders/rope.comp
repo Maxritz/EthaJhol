@@ -1,26 +1,30 @@
 #version 450
+/* Rotary position embedding. One invocation per (head, rotation pair). */
 
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) buffer Data { float qk[]; };
-layout(push_constant) uniform Params { uint head_dim; uint n_rot; float freq_scale; float theta_base; uint pos; uint half_dim; } p;
+
+layout(std430, binding = 0) buffer Data { float d[]; };
+layout(push_constant) uniform Params {
+    uint head_dim;
+    uint n_rot;
+    uint n_head;
+    uint pos;
+    float theta_base;
+    uint pairs;
+} p;
 
 void main() {
-    uint linear = gl_GlobalInvocationID.x;
-    uint total = (p.head_dim / 2u) * (p.head_dim / p.n_rot);
-    if (linear >= total) return;
-
-    uint pair_idx = linear % (p.head_dim / 2u);
-    uint head = linear / (p.head_dim / 2u);
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= p.n_head * p.pairs) return;
+    uint head = idx / p.pairs;
+    uint i = idx % p.pairs;
+    uint half_dim = p.head_dim / 2u;
     uint base = head * p.head_dim;
-
-    if (pair_idx >= p.n_rot) return;
-
-    float freq = float(p.pos) * p.freq_scale / pow(p.theta_base, float(2u * pair_idx) / float(p.head_dim));
-    float cos_val = cos(freq);
-    float sin_val = sin(freq);
-
-    float q0 = qk[base + pair_idx];
-    float q1 = qk[base + pair_idx + p.half_dim];
-    qk[base + pair_idx] = q0 * cos_val - q1 * sin_val;
-    qk[base + pair_idx + p.half_dim] = q0 * sin_val + q1 * cos_val;
+    float freq = float(p.pos) * exp2(-2.0 * float(i) / float(p.head_dim) * log2(p.theta_base));
+    float c = cos(freq);
+    float s = sin(freq);
+    float a = d[base + i];
+    float b = d[base + i + half_dim];
+    d[base + i] = a * c - b * s;
+    d[base + i + half_dim] = a * s + b * c;
 }

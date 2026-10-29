@@ -4,6 +4,7 @@
 #include "gguf.h"
 #include "tensor_source.h"
 #include "cpu_ops.h"
+#include "lora.h"
 
 #ifdef VG_HAS_VULKAN
 #include "vulkan_backend.h"
@@ -30,6 +31,7 @@ typedef struct VG_ModelConfig {
     int32_t eos_id;
     int has_biases;
     int has_gate_up;
+    int has_sub_norm;   /* BitNet b1.58 attn/ffn sub-norm RMSNorm weights */
     int is_swa;
     uint32_t n_ctx;
     uint32_t n_expert;
@@ -54,10 +56,23 @@ typedef struct VG_MoEState {
     uint32_t *expert_ids;
 } VG_MoEState;
 
+/* Top-k expert routing. Pass gate_logits when the caller already computed the router
+ * output; pass hidden (and NULL logits) to let the graph evaluate the router projection.
+ * Both NULL selects the first n_expert_used experts (used by capability checks). */
 VG_Status vg_model_graph_moe_route(VG_ModelGraph *graph, uint32_t layer,
                                    const float *hidden, float *gate_logits,
                                    VG_MoEState *state);
 void vg_moe_state_free(VG_MoEState *state);
+
+/* Attach a LoRA adapter. The delta y += scale * B * (A * x) is applied inside every
+ * weight matmul the adapter targets, so quantized weights never need requantizing.
+ * Pass NULL to detach. `scale` applies on top of each target's own `.scaling` value. */
+VG_Status vg_model_graph_set_lora(VG_ModelGraph *graph, const VG_LoraAdapter *adapter, float scale);
+
+/* Expert weight cache statistics (hits avoid re-resolving a stacked expert slice). */
+void vg_model_graph_expert_stats(VG_ModelGraph *graph, uint64_t *hits, uint64_t *misses,
+                                 uint64_t *evictions);
+VG_Status vg_model_graph_set_expert_cache(VG_ModelGraph *graph, uint32_t capacity);
 
 #ifdef VG_HAS_VULKAN
 void vg_model_graph_set_vulkan(VG_ModelGraph *graph, VG_VK *vk);
