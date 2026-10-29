@@ -307,7 +307,7 @@ VG_Status vg_tokenizer_load(const VG_GGUF *file, VG_Tokenizer **out) {
             }
         }
     }
-    fprintf(stderr, "[vg] tokenizer: control tokens=%zu\n", tok->added_count);
+    if (getenv("VG_DEBUG")) fprintf(stderr, "[vg] tokenizer: control tokens=%zu\n", tok->added_count);
 
     /* Load scores if available. */
     const char *scores_str = vg_gguf_meta(file, "tokenizer.ggml.scores");

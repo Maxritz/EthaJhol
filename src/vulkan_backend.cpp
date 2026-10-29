@@ -83,7 +83,8 @@ static bool read_file(const std::string &p, std::vector<uint32_t> &out) {
 }
 static void destroy_buffer(VG_VK *v, VG_VKBuffer *b) { if (!b) return; if (b->mapped) vkUnmapMemory(v->device, b->memory); if (b->buffer) vkDestroyBuffer(v->device, b->buffer, nullptr); if (b->memory) vkFreeMemory(v->device, b->memory, nullptr); if (v) v->memory_allocated -= b->bytes; delete b; }
 static VG_Status make_buffer_ex(VG_VK *v, size_t bytes, VkBufferUsageFlags usage, int device_local, VG_VKBuffer **out) {
-    if (!v || !out || bytes == 0) return VG_E_INVALID; *out = nullptr;
+    if (!v || !out || bytes == 0) return VG_E_INVALID;
+    *out = nullptr;
     if (v->memory_allocated + bytes > v->memory_budget_bytes) return VG_E_NOMEM;
     VG_VKBuffer *b = new VG_VKBuffer(); b->bytes = bytes; b->device_local = device_local;
     VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO}; ci.size = bytes; ci.usage = usage; ci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
@@ -275,7 +276,6 @@ static VG_Status create_pipeline(VG_VK *v, VG_VKPipeline *out, const char *spv_n
     }
     VkDescriptorSetLayoutCreateInfo sci{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
     sci.bindingCount = n_bindings; sci.pBindings = b;
-    VG_Status st = VG_OK;
     if (vkCreateDescriptorSetLayout(v->device, &sci, nullptr, &out->set_layout) != VK_SUCCESS) { delete[] b; return VG_E_NOMEM; }
     delete[] b;
 
@@ -342,13 +342,19 @@ static void bind_buffers(VG_VK *v, VkDescriptorSet set, VG_VKBuffer **bufs, uint
 }
 
 VG_Status vg_vk_open(const VG_VKConfig *cfg, VG_VK **out) {
-    if (!out) return VG_E_INVALID; *out = nullptr; VG_VK *v = new VG_VK(); if (cfg && cfg->shader_dir) v->shader_dir = cfg->shader_dir;
+    if (!out) return VG_E_INVALID;
+    *out = nullptr;
+    VG_VK *v = new VG_VK();
+    if (cfg && cfg->shader_dir) v->shader_dir = cfg->shader_dir;
     VkApplicationInfo app{VK_STRUCTURE_TYPE_APPLICATION_INFO}; app.pApplicationName = "vg-gguf"; app.applicationVersion = 1; app.pEngineName = "vg-gguf"; app.engineVersion = 1; app.apiVersion = VK_API_VERSION_1_1;
     VkInstanceCreateInfo ici{VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO}; ici.pApplicationInfo = &app; if (vkCreateInstance(&ici, nullptr, &v->instance) != VK_SUCCESS) { delete v; return VG_E_UNSUPPORTED; }
     uint32_t n = 0; vkEnumeratePhysicalDevices(v->instance, &n, nullptr); if (!n) { vg_vk_close(v); return VG_E_UNSUPPORTED; } std::vector<VkPhysicalDevice> ds(n); vkEnumeratePhysicalDevices(v->instance, &n, ds.data());
     uint32_t chosen = cfg ? cfg->device_index : UINT32_MAX; if (chosen >= n) { chosen = 0; if (cfg && cfg->prefer_discrete) for (uint32_t i = 0; i < n; ++i) { VkPhysicalDeviceProperties p{}; vkGetPhysicalDeviceProperties(ds[i], &p); if (p.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) { chosen = i; break; } } }
     v->physical = ds[chosen]; vkGetPhysicalDeviceMemoryProperties(v->physical, &v->mem); VkPhysicalDeviceProperties pp{}; vkGetPhysicalDeviceProperties(v->physical, &pp); std::snprintf(v->info.name, sizeof(v->info.name), "%s", pp.deviceName); v->info.api_version = pp.apiVersion; v->info.vendor_id = pp.vendorID; v->info.device_id = pp.deviceID; v->info.discrete = pp.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-    for (uint32_t i = 0; i < v->mem.memoryHeapCount; ++i) if (v->mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) v->info.device_local_bytes += v->mem.memoryHeaps[i].size; v->info.device_local_budget = v->info.device_local_bytes;
+    for (uint32_t i = 0; i < v->mem.memoryHeapCount; ++i)
+        if (v->mem.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
+            v->info.device_local_bytes += v->mem.memoryHeaps[i].size;
+    v->info.device_local_budget = v->info.device_local_bytes;
     v->memory_budget_bytes = (cfg && cfg->memory_budget_bytes) ? cfg->memory_budget_bytes : v->info.device_local_bytes;
     {
         /* Soft VRAM budget for the persistent weight/expert cache. Keep headroom
@@ -769,6 +775,11 @@ VG_Status vg_vk_softmax(VG_VK *v, VG_VKBuffer *data, uint32_t dim) {
 
 VG_Status vg_vk_rope(VG_VK *v, VG_VKBuffer *data, uint32_t head_dim, uint32_t n_rot, float freq_scale, float theta_base, uint32_t pos) {
     if (!v || !data || !head_dim || !n_rot) return VG_E_INVALID;
+    /* The rope shader takes precomputed frequencies (rope_freqs), so the scalar form is not
+     * needed here; keep the parameters for API symmetry with the CPU kernel and say so
+     * instead of leaving them apparently forgotten. */
+    (void)freq_scale;
+    (void)theta_base;
     uint64_t t0 = vg_trace_now_ns();
 
     VkDescriptorPool pool{}; VkDescriptorSet set{};

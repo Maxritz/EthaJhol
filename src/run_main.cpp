@@ -1,22 +1,46 @@
 #include "vg/full_engine.h"
 #include "vg/gguf.h"
-#include "vg/tensor_source.h"
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <chrono>
 
-static std::chrono::steady_clock::time_point g_t_first, g_t_last; static uint64_t g_t_n = 0;
-static int emit(const char *piece, size_t bytes, int32_t token, void *user) { (void)token; (void)user; auto now = std::chrono::steady_clock::now(); if (!g_t_n) g_t_first = now; g_t_last = now; ++g_t_n; std::fwrite(piece, 1, bytes, stdout); std::fflush(stdout); return 1; }
+static std::chrono::steady_clock::time_point g_t_first, g_t_last;
+static uint64_t g_t_n = 0;
 
+static int emit(const char *piece, size_t bytes, int32_t token, void *user) {
+    (void)token; (void)user;
+    auto now = std::chrono::steady_clock::now();
+    if (!g_t_n) g_t_first = now;
+    g_t_last = now;
+    ++g_t_n;
+    std::fwrite(piece, 1, bytes, stdout);
+    std::fflush(stdout);
+    return 1;
+}
+
+static const char *st_name(VG_Status s) {
+    switch (s) {
+        case VG_OK: return "ok";
+        case VG_E_INVALID: return "invalid argument";
+        case VG_E_IO: return "io error";
+        case VG_E_FORMAT: return "malformed file";
+        case VG_E_RANGE: return "out of range";
+        case VG_E_NOMEM: return "out of memory";
+        case VG_E_UNSUPPORTED: return "unsupported";
+        case VG_E_BUSY: return "busy";
+        default: return "error";
+    }
+}
+
+/* Llama-3 chat framing. A system turn is included when system_text is non-NULL.
+ * Returns a heap string (caller frees) or nullptr on OOM. */
 static char *chat_template_llama3(const char *user_text, const char *system_text) {
-    /* Mirrors main.c chat_mode template. If system_text is non-NULL the system
-     * turn is included; otherwise only the user turn is formatted.
-     * Returns heap-allocated string (caller frees), or nullptr on OOM. */
     const char *tpl_sys = "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n%s<|eot_id|><|start_header_id|>user<|end_header_id|>\n%s<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n";
     const char *tpl_user = "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n%s<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n";
     const char *tpl = system_text ? tpl_sys : tpl_user;
-    size_t need = std::snprintf(nullptr, 0, tpl, system_text ? system_text : user_text, user_text) + 1;
+    size_t need = (size_t)std::snprintf(nullptr, 0, tpl, system_text ? system_text : user_text, user_text) + 1;
     char *buf = (char *)std::malloc(need);
     if (!buf) return nullptr;
     if (system_text) std::snprintf(buf, need, tpl_sys, system_text, user_text);
@@ -37,28 +61,36 @@ static bool is_instruct(const VG_GGUF *g) {
     return vg_gguf_meta(g, "tokenizer.chat_template") != nullptr;
 }
 
-/* The Llama-3 chat template is only meaningful when the vocabulary actually
- * contains its control tokens; a 32k SentencePiece vocab (Mistral etc.) would
- * see "<|start_header_id|>" shredded by BPE into noise. */
+/* The Llama-3 chat template is only meaningful when the vocabulary actually contains its
+ * control tokens; a 32k SentencePiece vocab (Mistral etc.) would see "<|start_header_id|>"
+ * shredded by BPE into noise. */
 static bool has_llama3_vocab(const VG_GGUF *g) {
     const char *tokens = vg_gguf_meta(g, "tokenizer.ggml.tokens");
     return tokens && strstr(tokens, "<|start_header_id|>") != nullptr;
 }
 
-static void usage(const char *p) { std::fprintf(stderr, "usage: %s -m MODEL.gguf [-p PROMPT | -f FILE] [-n TOKENS] [-c CONTEXT] [--temp T] [--top-k K] [--top-p P] [--threads N] [--seed N] [--no-mmap] [--ngl LAYERS] [--system S]\n", p); }
+static void usage(const char *p) {
+    std::fprintf(stderr,
+        "usage: %s -m MODEL.gguf [-p PROMPT | -f FILE] [-n TOKENS] [-c CONTEXT]\n"
+        "          [--temp T] [--top-k K] [--top-p P] [--threads N] [--seed N]\n"
+        "          [--no-mmap] [--ngl LAYERS] [--system S]\n"
+        "          [--lora ADAPTER.gguf] [--lora-scale S]\n", p);
+}
+
 int main(int argc, char **argv) {
-    std::setvbuf(stderr, nullptr, _IONBF, 0);
-    std::setvbuf(stdout, nullptr, _IONBF, 0);
-    std::fprintf(stderr, "[vg] DBG main entered model=%s\n", "");
-    const char *model = nullptr; const char *prompt = "Hello";
-    const char *system_prompt = nullptr; /* nullptr => use default for instruct models */
+    const char *model = nullptr;
+    const char *prompt = "Hello";
+    const char *prompt_file = nullptr;
+    const char *system_prompt = nullptr; /* nullptr => default text for instruct models */
+
     VG_GenerateConfig c{};
     c.n_predict = 128; c.n_ctx = 4096; c.seed = 0xffffffffu;
     c.top_k = 40; c.top_p = 0.95f; c.temperature = 0.8f;
     c.repeat_penalty = 1.1f; c.repeat_last_n = 64;
     c.use_mmap = 1; c.n_threads = 0;
     c.use_gpu = 0; c.ngl_layers = 0;
-    const char *prompt_file = nullptr;
+    c.lora_path = nullptr; c.lora_scale = 1.0f;
+
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "--help") || !std::strcmp(argv[i], "-h")) { usage(argv[0]); return 0; }
         else if (!std::strcmp(argv[i], "-m") && i + 1 < argc) model = argv[++i];
@@ -73,14 +105,22 @@ int main(int argc, char **argv) {
         else if (!std::strcmp(argv[i], "--seed") && i + 1 < argc) c.seed = (uint32_t)std::strtoul(argv[++i], nullptr, 10);
         else if (!std::strcmp(argv[i], "--no-mmap")) { c.use_mmap = 0; }
         else if (!std::strcmp(argv[i], "--ngl") && i + 1 < argc) { c.ngl_layers = std::atoi(argv[++i]); c.use_gpu = (c.ngl_layers > 0) ? 1 : 0; }
+        else if (!std::strcmp(argv[i], "--lora") && i + 1 < argc) { c.lora_path = argv[++i]; }
+        else if (!std::strcmp(argv[i], "--lora-scale") && i + 1 < argc) { c.lora_scale = std::strtof(argv[++i], nullptr); }
         else if (!std::strcmp(argv[i], "--system") && i + 1 < argc) system_prompt = argv[++i];
-        else { usage(argv[0]); return 1; }
+        else {
+            std::fprintf(stderr, "unknown or incomplete option: %s\n", argv[i]);
+            usage(argv[0]);
+            return 1;
+        }
     }
-    if (!model) { usage(argv[0]); return 1; }
+    if (!model) { std::fprintf(stderr, "no model given\n"); usage(argv[0]); return 1; }
+
+    char *prompt_buf = nullptr;
     if (prompt_file) {
         FILE *fp = std::fopen(prompt_file, "rb");
         if (!fp) { std::fprintf(stderr, "cannot open prompt file: %s\n", prompt_file); return 2; }
-        /* Grow-while-reading: no ftell, so >4 GiB-unsafe 32-bit offsets cannot bite. */
+        /* Grow-while-reading: no ftell, so a >4 GiB offset cannot be truncated to 32 bits. */
         size_t cap = 4096, len = 0;
         char *buf = (char *)std::malloc(cap);
         if (!buf) { std::fclose(fp); return 2; }
@@ -95,16 +135,15 @@ int main(int argc, char **argv) {
             len += got;
             if (got < 4096) break;
         }
-        buf[len] = 0; std::fclose(fp);
-        prompt = buf;
+        buf[len] = 0;
+        std::fclose(fp);
+        prompt_buf = buf;
+        prompt = prompt_buf;
     }
 
-    /* Auto-frame instruct models: feed raw user text through a chat template
-     * (with a system turn) so an Instruct-tuned model sees proper turn
-     * structure instead of a raw completion prompt. Pass a short-lived handle
-     * just for metadata; the real prefetch handle opens below. Skip framing if
-     * the caller already supplied a templated prompt (starts with the BOS
-     * token text). */
+    /* Auto-frame instruct models so an Instruct-tuned model sees real turn structure
+     * instead of a raw completion prompt. A prompt that already starts with the BOS
+     * token text is left alone. */
     const char *framed = prompt;
     char *framed_alloc = nullptr;
     if (prompt && prompt[0] &&
@@ -121,25 +160,19 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Open native tensor source for readahead prefetch. */
-    VG_GGUF *gguf = nullptr; VG_TensorSource *src = nullptr;
-    if (vg_gguf_open(model, &gguf) == VG_OK) {
-        VG_TensorSourceConfig cfg{}; cfg.host_budget_bytes = 256u * 1024u * 1024u; cfg.io_chunk_bytes = 4u * 1024u * 1024u; cfg.use_mmap = 1; cfg.prefetch_depth = 4;
-        if (vg_tensor_source_open(gguf, &cfg, &src) == VG_OK) {
-            c.use_mmap = 1;
-        } else {
-            vg_gguf_close(gguf); gguf = nullptr;
-        }
+    const VG_Status st = vg_generate(model, framed, &c, emit, nullptr);
+    if (g_t_n > 1) {
+        double secs = std::chrono::duration<double>(g_t_last - g_t_first).count();
+        std::fprintf(stderr, "[vg] TG: %llu tokens in %.3fs = %.1f t/s\n",
+                     (unsigned long long)g_t_n, secs,
+                     (double)(g_t_n - 1) / (secs > 0 ? secs : 1e-9));
     }
-
-    /* Set up prefetch_source if we have a tensor source */
-    // Note: prefetch_source field removed from config for simplicity
-
-    VG_Status st = vg_generate(model, framed, &c, emit, nullptr);
-    if (g_t_n > 1) { double secs = std::chrono::duration<double>(g_t_last - g_t_first).count(); std::fprintf(stderr, "[vg] TG: %llu tokens in %.3fs = %.1f t/s\n", (unsigned long long)g_t_n, secs, (double)(g_t_n - 1) / (secs > 0 ? secs : 1e-9)); }
     std::fputc('\n', stdout);
-    if (src) vg_tensor_source_close(src);
-    if (gguf) vg_gguf_close(gguf);
-    if (framed_alloc) std::free(framed_alloc);
-    return st == VG_OK ? 0 : 2;
+    std::free(prompt_buf);
+    std::free(framed_alloc);
+    if (st != VG_OK) {
+        std::fprintf(stderr, "generation failed: %s\n", st_name(st));
+        return 2;
+    }
+    return 0;
 }

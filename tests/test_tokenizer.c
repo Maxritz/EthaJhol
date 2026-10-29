@@ -224,7 +224,7 @@ static void test_sentencepiece_space(const char *label, const VG_Tokenizer *tok)
     }
     size_t n = vg_tokenizer_vocab_size(tok);
     int leaked = 0, checked = 0;
-    char first[128];
+    char first[272];   /* "id=<n> leaked U+2581: " plus a full 128-byte token rendering */
     first[0] = 0;
     for (size_t id = 0; id < n && !leaked; ++id) {
         char buf[128];
@@ -320,9 +320,8 @@ static void test_added_tokens(const char *label, const ModelCase *mc, const VG_T
         size_t need = vg_tokenizer_encode(tok, tmpl, NULL, 0);
         int32_t *ids = (int32_t *)malloc(need * sizeof(int32_t));
         size_t n = ids ? vg_tokenizer_encode(tok, tmpl, ids, need) : 0;
-        int has_bos = 0, has_start = 0, has_endhdr = 0, has_eot = 0;
+        int has_start = 0, has_endhdr = 0, has_eot = 0;
         for (size_t i = 0; i < n; ++i) {
-            if (ids[i] == 128000) has_bos = 1;
             if (ids[i] == 128006) has_start = 1;
             if (ids[i] == 128007) has_endhdr = 1;
             if (ids[i] == 128009) has_eot = 1;

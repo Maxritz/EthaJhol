@@ -11,3 +11,6 @@ build-bundled/
 build-core/
 build-cpu-*/
 third_party/*/build*/
+build-warn/
+build-*/
+fixture_*.gguf

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 #include "gguf.h"
 
 #ifdef __cplusplus
@@ -39,10 +40,15 @@ typedef enum VG_QuantKind {
     VG_QUANT_I64     = 27,
     VG_QUANT_IQ1_M   = 29,
     VG_QUANT_BF16    = 30,
+    /* Ternary / 1-bit types (BitNet b1.58 and the Ternary-Bonsai family). Layouts are
+     * byte-identical to ggml: TQ1_0 = 54 B/256 w (1.6875 bpw, radix-3 packing),
+     * TQ2_0 = 66 B/256 w (2.0625 bpw, 2-bit planes), Q1_0 = 18 B/128 w, Q2_0 = 18 B/64 w. */
+    VG_QUANT_TQ1_0   = 34,
+    VG_QUANT_TQ2_0   = 35,
     VG_QUANT_MXFP4   = 39,
     VG_QUANT_NVFP4   = 40,
-    VG_QUANT_Q1_0    = 41,
-    VG_QUANT_Q2_0    = 42
+    VG_QUANT_Q1_0    = 41,   /* 128 weights per 18-byte block: 1 sign bit per weight     */
+    VG_QUANT_Q2_0    = 42    /*  64 weights per 18-byte block: 2 bits, codes -1/0/+1/+2  */
 } VG_QuantKind;
 
 #define VG_QUANT_BYTES_PER_BLOCK_F32     4
@@ -85,9 +91,36 @@ typedef struct VG_QuantInfo {
     uint32_t block_size;
     uint32_t bytes_per_block;
     uint32_t alignment;
-    int supported_scalar;
-    int supported_vulkan;
+    int supported_scalar;   /* dequantize + fused matmul available on the CPU path */
+    int supported_vulkan;   /* dedicated compute shader exists in shaders/ */
 } VG_QuantInfo;
+
+/* IEEE-754 binary16 -> binary32, exactly rounded (including subnormals and Inf/NaN).
+ * Shared by every CPU kernel so dequantization never disagrees between paths. */
+static inline float vg_half_to_float(uint16_t h) {
+    uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+    uint32_t exp = (uint32_t)((h >> 10) & 0x1Fu);
+    uint32_t mant = (uint32_t)(h & 0x3FFu);
+    uint32_t bits;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign;
+        } else {
+            /* Subnormal half: normalize the mantissa into a binary32 normal. */
+            uint32_t e = 127u - 15u + 1u;
+            while (!(mant & 0x400u)) { mant <<= 1u; --e; }
+            mant &= 0x3FFu;
+            bits = sign | (e << 23) | (mant << 13);
+        }
+    } else if (exp == 31u) {
+        bits = sign | 0x7F800000u | (mant << 13);
+    } else {
+        bits = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
 const VG_QuantInfo *vg_quant_info(uint32_t ggml_type);
 VG_Status vg_quant_validate(uint32_t ggml_type, uint64_t elements, uint64_t bytes);
@@ -95,6 +128,10 @@ VG_Status vg_dequantize_row(uint32_t ggml_type, const void *packed, size_t packe
                             float *out, size_t elements);
 VG_Status vg_quantized_dot(uint32_t ggml_type, const void *packed, size_t packed_bytes,
                            const float *x, size_t elements, float *out);
+
+/* Dequantize exactly one block (block_size elements) into out. Used by blocked kernels
+ * that never materialize a full dequantized matrix. */
+VG_Status vg_dequantize_block(uint32_t ggml_type, const void *block, float *out);
 
 #ifdef __cplusplus
 }

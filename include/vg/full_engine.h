@@ -23,6 +23,9 @@ typedef struct VG_GenerateConfig {
     int32_t n_threads;
     int32_t use_gpu;
     int32_t ngl_layers;
+    /* Optional LoRA adapter (GGUF) applied during generation; NULL leaves the model as-is. */
+    const char *lora_path;
+    float lora_scale;         /* extra multiplier on top of each target's `.scaling` */
 } VG_GenerateConfig;
 
 typedef int (*VG_TokenCallback)(const char *piece, size_t bytes, int32_t token_id, void *user);

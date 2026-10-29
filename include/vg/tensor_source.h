@@ -22,6 +22,10 @@ typedef struct VG_TensorLease {
     VG_Tier tier;
     uint64_t ticket;
     VG_TensorSource *source;
+    /* 1 when `data` points into the file mapping. Such a pointer outlives the lease, while an
+     * unticketed, unmapped lease is a private buffer that release frees. Both carry the same
+     * tier (a storage lease can be either), so the flag is the only reliable discriminator. */
+    unsigned mapped;
 } VG_TensorLease;
 
 typedef struct VG_TensorSourceStats {

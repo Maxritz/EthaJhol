@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L /* nanosleep in the io worker */
 #include "vg/tensor_source.h"
 #include "vg/trace.h"
 
@@ -100,17 +101,38 @@ static void *io_worker(void *param) {
             #ifdef _WIN32
             Sleep(1);
             #else
-            struct timespec ts = {0, 1000000}; nanosleep(&ts, NULL);
+            struct timespec ts = {0, 1000000};
+            nanosleep(&ts, NULL);
             #endif
             continue;
         }
         const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, req->name);
-        if (!t) { req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        /* The request node is owned by the worker once it is dequeued: every exit path frees
+         * it (previously none did, so each async prefetch leaked its VG_IORequest). The loaded
+         * bytes are handed to the caller's entry and owned by it from then on. */
+        if (!t) {
+            req->error = 1;
+            if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; }
+            free(req);
+            continue;
+        }
         req->bytes = (size_t)t->nbytes;
         req->data = malloc(req->bytes ? req->bytes : 1);
-        if (!req->data) { req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        if (!req->data) {
+            req->error = 1;
+            if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; }
+            free(req);
+            continue;
+        }
         VG_Status st = vg_gguf_read(s->file, t, 0, req->data, req->bytes);
-        if (st != VG_OK) { free(req->data); req->data = NULL; req->error = 1; if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; } continue; }
+        if (st != VG_OK) {
+            free(req->data);
+            req->data = NULL;
+            req->error = 1;
+            if (req->io_entry) { req->io_entry->error = 1; req->io_entry->ready = 1; }
+            free(req);
+            continue;
+        }
         req->ready = 1;
         if (req->io_entry) {
             req->io_entry->data = req->data;
@@ -118,6 +140,7 @@ static void *io_worker(void *param) {
             req->io_entry->ready = 1;
             req->io_entry->error = 0;
         }
+        free(req);
     }
 #ifdef _WIN32
     return 0;
@@ -129,11 +152,17 @@ static size_t resident_bytes(const VG_TensorSource *s) {
     size_t total = 0; for (size_t i = 0; i < s->count; ++i) if (s->entries[i].owns) total += s->entries[i].bytes; return total;
 }
 static void remove_entry(VG_TensorSource *s, size_t i) {
-    if (i >= s->count) return; if (s->entries[i].owns) free(s->entries[i].data);
-    if (i + 1 < s->count) memmove(&s->entries[i], &s->entries[i + 1], (s->count - i - 1) * sizeof(*s->entries)); --s->count; ++s->stats.evictions;
+    if (i >= s->count) return;
+    if (s->entries[i].owns) free(s->entries[i].data);
+    if (i + 1 < s->count)
+        memmove(&s->entries[i], &s->entries[i + 1], (s->count - i - 1) * sizeof(*s->entries));
+    --s->count;
+    ++s->stats.evictions;
 }
 static VG_CacheEntry *find_entry(VG_TensorSource *s, const VG_GGUF_Tensor *t, VG_Tier tier) {
-    for (size_t i = 0; i < s->count; ++i) if (s->entries[i].tensor == t && s->entries[i].tier == tier) return &s->entries[i]; return NULL;
+    for (size_t i = 0; i < s->count; ++i)
+        if (s->entries[i].tensor == t && s->entries[i].tier == tier) return &s->entries[i];
+    return NULL;
 }
 static void evict_for(VG_TensorSource *s, size_t need) {
     size_t budget = s->cfg.host_budget_bytes;
@@ -141,14 +170,19 @@ static void evict_for(VG_TensorSource *s, size_t need) {
     while (resident_bytes(s) > budget || (need && resident_bytes(s) > budget - need)) {
         size_t victim = (size_t)-1; uint64_t age = UINT64_MAX;
         for (size_t i = 0; i < s->count; ++i) if (s->entries[i].owns && s->entries[i].refs == 0 && s->entries[i].age < age) { victim = i; age = s->entries[i].age; }
-        if (victim == (size_t)-1) break; remove_entry(s, victim);
+        if (victim == (size_t)-1) break;
+        remove_entry(s, victim);
     }
 }
 VG_Status vg_tensor_source_open(VG_GGUF *file, const VG_TensorSourceConfig *cfg, VG_TensorSource **out) {
-    if (!file || !out) return VG_E_INVALID; *out = NULL;
+    if (!file || !out) return VG_E_INVALID;
+    *out = NULL;
     VG_TensorSource *s = (VG_TensorSource *)calloc(1, sizeof(*s)); if (!s) return VG_E_NOMEM; s->file = file;
     s->cfg.host_budget_bytes = 512u * 1024u * 1024u; s->cfg.io_chunk_bytes = 4u * 1024u * 1024u; s->cfg.prefetch_depth = 2; s->cfg.use_mmap = 1;
-    if (cfg) s->cfg = *cfg; if (s->cfg.io_chunk_bytes == 0) s->cfg.io_chunk_bytes = 4u * 1024u * 1024u; s->stats.bytes_budget = s->cfg.host_budget_bytes; s->stats.device_budget = s->cfg.device_budget_bytes;
+    if (cfg) s->cfg = *cfg;
+    if (s->cfg.io_chunk_bytes == 0) s->cfg.io_chunk_bytes = 4u * 1024u * 1024u;
+    s->stats.bytes_budget = s->cfg.host_budget_bytes;
+    s->stats.device_budget = s->cfg.device_budget_bytes;
     if (s->cfg.use_direct_io) vg_gguf_set_direct_io(file, 1);
 #ifdef _WIN32
     InitializeCriticalSection(&s->lock);
@@ -178,7 +212,16 @@ void vg_tensor_source_close(VG_TensorSource *s) {
         #endif
     }
     lock_src(s); for (size_t i = 0; i < s->count; ++i) if (s->entries[i].owns) free(s->entries[i].data); free(s->entries); unlock_src(s);
-    while (s->io_queue_head) { VG_IORequest *n = s->io_queue_head->next; free((void*)s->io_queue_head); s->io_queue_head = n; }
+    /* Requests still queued at close never reach the worker: drop the node and, when the
+     * payload was not published to the caller's entry, the payload too. */
+    while (s->io_queue_head) {
+        VG_IORequest *n = s->io_queue_head->next;
+        VG_IORequest *r = s->io_queue_head;
+        if (r->data && (!r->io_entry || !r->io_entry->ready)) free(r->data);
+        free(r);
+        s->io_queue_head = n;
+    }
+    s->io_queue_tail = NULL;
 #ifdef _WIN32
     DeleteCriticalSection(&s->lock);
 #else
@@ -187,7 +230,8 @@ void vg_tensor_source_close(VG_TensorSource *s) {
     free(s);
 }
 VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desired, VG_TensorLease *out) {
-    if (!s || !name || !out) return VG_E_INVALID; memset(out, 0, sizeof(*out));
+    if (!s || !name || !out) return VG_E_INVALID;
+    memset(out, 0, sizeof(*out));
     uint64_t t0 = vg_trace_now_ns();
     const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, name); if (!t) return VG_E_INVALID;
     /* A storage lease returns a pointer into the mapped file. Virtual mapping is lazy and does not
@@ -199,7 +243,7 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
         lock_src(s); ++s->stats.lookups;
         VG_Status mst = vg_gguf_map(s->file, &mbase, &msize);
         if (mst == VG_OK && t->data_offset <= msize - vg_gguf_data_base(s->file)) {
-            ++s->stats.hits; out->tensor = t; out->data = (const unsigned char *)mbase + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0;
+            ++s->stats.hits; out->tensor = t; out->data = (const unsigned char *)mbase + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; out->mapped = 1;
             unlock_src(s); vg_trace_emit("tensor_acquire_storage", t0, vg_trace_now_ns(), t->nbytes, 0); return VG_OK;
         }
         unlock_src(s);
@@ -212,7 +256,7 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
     if (desired == VG_TIER_STORAGE && s->cfg.use_mmap) {
         const void *base; uint64_t size; VG_Status st = vg_gguf_map(s->file, &base, &size);
         if (st != VG_OK || t->data_offset > size - vg_gguf_data_base(s->file)) { unlock_src(s); return VG_E_IO; }
-        out->tensor = t; out->data = (const unsigned char *)base + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; unlock_src(s); return VG_OK;
+        out->tensor = t; out->data = (const unsigned char *)base + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; out->mapped = 1; unlock_src(s); return VG_OK;
     }
     size_t n = (size_t)t->nbytes; void *data = malloc(n ? n : 1u); if (!data) { unlock_src(s); return VG_E_NOMEM; }
     VG_Status st = vg_gguf_read(s->file, t, 0, data, n); if (st != VG_OK) { free(data); unlock_src(s); return st; }
@@ -235,9 +279,11 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
     return VG_OK;
 }
 void vg_tensor_release(VG_TensorLease *lease) {
-    if (!lease || !lease->source) return; VG_TensorSource *s = lease->source; lock_src(s);
+    if (!lease || !lease->source) return;
+    VG_TensorSource *s = lease->source;
+    lock_src(s);
     if (lease->ticket) { for (size_t i = 0; i < s->count; ++i) if (s->entries[i].ticket == lease->ticket && s->entries[i].tensor == lease->tensor) { if (s->entries[i].refs) --s->entries[i].refs; break; } }
-    else if (lease->data && lease->tier != VG_TIER_STORAGE) free((void *)lease->data);
+    else if (lease->data && !lease->mapped) free((void *)lease->data);
     unlock_src(s); memset(lease, 0, sizeof(*lease));
 }
 VG_Status vg_tensor_prefetch(VG_TensorSource *s, const char *const *names, size_t count, VG_Tier desired) {
@@ -280,7 +326,10 @@ VG_Status vg_tensor_wait(VG_TensorSource *s, VG_PrefetchEntry *entry) {
 }
 void vg_tensor_source_stats(const VG_TensorSource *sc, VG_TensorSourceStats *out) { if (!sc || !out) return; VG_TensorSource *s = (VG_TensorSource *)sc; lock_src(s); *out = s->stats; unlock_src(s); }
 VG_Status vg_tensor_stream(VG_TensorSource *s, const char *name, size_t chunk, VG_Status (*consume)(const void *, size_t, uint64_t, void *), void *user) {
-    if (!s || !name || !consume) return VG_E_INVALID; const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, name); if (!t) return VG_E_INVALID; if (!chunk) chunk = s->cfg.io_chunk_bytes;
+    if (!s || !name || !consume) return VG_E_INVALID;
+    const VG_GGUF_Tensor *t = vg_gguf_find_tensor(s->file, name);
+    if (!t) return VG_E_INVALID;
+    if (!chunk) chunk = s->cfg.io_chunk_bytes;
     void *buf = malloc(chunk); if (!buf) return VG_E_NOMEM;     VG_Status st = VG_OK;
     for (uint64_t off = 0; off < t->nbytes && st == VG_OK;) { size_t n = (size_t)((t->nbytes - off) < chunk ? (t->nbytes - off) : chunk); st = vg_gguf_read(s->file, t, off, buf, n); if (st == VG_OK) st = consume(buf, n, off, user); off += n; }
     free(buf); return st;

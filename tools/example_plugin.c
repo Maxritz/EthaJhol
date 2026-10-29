@@ -14,5 +14,6 @@ static const VG_Plugin g_plugin = {
 };
 
 VG_PLUGIN_EXPORT const VG_Plugin *vg_plugin_entry(uint32_t host_abi, const VG_PluginHost *host) {
+    (void)host;
     return host_abi == VG_PLUGIN_ABI_VERSION ? &g_plugin : NULL;
 }
