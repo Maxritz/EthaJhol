@@ -40,6 +40,8 @@ int vg_fixture_write_dense(const char *path);
 int vg_fixture_write_unsupported(const char *path);
 /* MoE model with stacked expert tensors and a router projection. */
 int vg_fixture_write_moe(const char *path);
+/* Same MoE fixture with every expert weight zeroed (regression probe for the FFN path). */
+int vg_fixture_write_moe_zero(const char *path);
 
 /* BitNet-style model: "bitnet" architecture, TQ2_0 ternary projections, attn/ffn sub-norms,
  * and one per-tensor output scale, so the whole 1.58-bit code path is exercised end to end. */

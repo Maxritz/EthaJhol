@@ -557,6 +557,44 @@ static void test_moe_routing(const char *path) {
     CHECK(vg_model_graph_set_expert_cache(g, 2) == VG_OK);
     CHECK(vg_model_graph_decode(g, cfg->bos_id, 2, logits) == VG_OK);
 
+    /* Regression: the routed experts must actually reach the residual stream. The MoE
+     * block used to zero its input buffer before the expert matvecs, so every expert
+     * multiplied a zero vector and this comparison against an all-zero-expert model was
+     * bit-identical. */
+    {
+        size_t zlen = strlen(path) + 16u;
+        char *zero_path = (char *)malloc(zlen);
+        if (zero_path) {
+            snprintf(zero_path, zlen, "%s.zero.gguf", path);
+            if (vg_fixture_write_moe_zero(zero_path) == 0) {
+                VG_GGUF *zf = NULL;
+                VG_TensorSource *zs = NULL;
+                VG_ModelGraph *zg = load_graph(zero_path, &zf, &zs);
+                CHECK(zg != NULL);
+                if (zg) {
+                    float *zl = (float *)malloc(cfg->n_vocab * sizeof(float));
+                    assert(zl);
+                    vg_model_graph_reset(g);
+                    CHECK(vg_model_graph_decode(g, cfg->bos_id, 0, logits) == VG_OK);
+                    vg_model_graph_reset(zg);
+                    CHECK(vg_model_graph_decode(zg, cfg->bos_id, 0, zl) == VG_OK);
+                    double diff = 0.0;
+                    for (uint32_t i = 0; i < cfg->n_vocab; ++i) {
+                        double d = fabs((double)logits[i] - (double)zl[i]);
+                        if (d > diff) diff = d;
+                    }
+                    CHECK(diff > 1e-4);
+                    free(zl);
+                    vg_model_graph_free(zg);
+                }
+                vg_tensor_source_close(zs);
+                vg_gguf_close(zf);
+            }
+            remove(zero_path);
+            free(zero_path);
+        }
+    }
+
     free(x); free(gate); free(logits);
     vg_model_graph_free(g);
     vg_tensor_source_close(src);

@@ -180,17 +180,70 @@ VG_Status vg_model_probe(VG_GGUF *file, VG_ModelProbe *out) {
     out->has_bias = vg_gguf_find_tensor(file, "blk.0.attn_q.bias") != NULL;
     out->has_qk_norm = vg_gguf_find_tensor(file, "blk.0.attn_q_norm.weight") != NULL;
     out->has_sub_norm = vg_gguf_find_tensor(file, "blk.0.attn_sub_norm.weight") != NULL;
+    out->has_post_norm = vg_gguf_find_tensor(file, "blk.0.attn_post_norm.weight") != NULL &&
+                          vg_gguf_find_tensor(file, "blk.0.ffn_post_norm.weight") != NULL;
+    out->has_shared_expert = vg_gguf_find_tensor(file, "blk.0.ffn_gate_shexp.weight") != NULL &&
+                             vg_gguf_find_tensor(file, "blk.0.ffn_down_shexp.weight") != NULL;
     out->is_moe = out->n_expert > 1 && vg_gguf_find_tensor(file, "blk.0.ffn_gate_inp.weight") != NULL;
     if (out->is_moe && !out->n_expert_used) out->n_expert_used = 1;
 
-    if (!arch_supported(arch)) {
-        fail(out, VG_E_UNSUPPORTED, NULL,
-             "architecture '%s' is not implemented (supported: llama, mistral, qwen2/3, gemma, mixtral)", arch);
-        return VG_OK;
-    }
     if (!out->n_layer || !out->n_embd || !out->head_dim) {
         fail(out, VG_E_FORMAT, NULL, "model geometry is incomplete (n_layer=%u n_embd=%u head_dim=%u)",
              out->n_layer, out->n_embd, out->head_dim);
+        return VG_OK;
+    }
+
+    /* Tensor layouts the evaluator cannot split or normalise. Accepting these would
+     * report SUPPORTED and then silently compute a different model, so they are refused
+     * by name instead. */
+    {
+        static const struct { const char *tensor; const char *why; } k_unhandled[] = {
+            { "blk.0.attn_qkv.weight", "fused QKV projection (attn_qkv.weight)" },
+            { "blk.0.attn_q_a.weight", "MLA compressed Q projection (attn_q_a.weight)" },
+            { "blk.0.kv_a_proj_with_mqa.weight", "MLA KV projection (kv_a_proj_with_mqa.weight)" },
+            { "blk.0.ffn_gate_up.weight", "fused gate/up projection (ffn_gate_up.weight)" },
+            { "position_embd.weight", "learned positional embeddings (position_embd.weight)" },
+            { "blk.0.attn_conv_q.weight", "convolutional attention (attn_conv_q.weight)" }
+        };
+        for (size_t i = 0; i < sizeof(k_unhandled) / sizeof(k_unhandled[0]); ++i) {
+            if (vg_gguf_find_tensor(file, k_unhandled[i].tensor)) {
+                fail(out, VG_E_UNSUPPORTED, k_unhandled[i].tensor,
+                     "%s is not implemented by this evaluator", k_unhandled[i].why);
+                return VG_OK;
+            }
+        }
+        /* Gate and up packed together in ffn_up: llm_build phi3 style. */
+        const VG_GGUF_Tensor *fu = vg_gguf_find_tensor(file, "blk.0.ffn_up.weight");
+        if (fu && out->n_ff && fu->n_dims >= 2 &&
+            fu->dims[1] == 2u * (uint64_t)out->n_ff &&
+            !vg_gguf_find_tensor(file, "blk.0.ffn_gate.weight")) {
+            fail(out, VG_E_UNSUPPORTED, "blk.0.ffn_up.weight",
+                 "ffn_up.weight packs gate and up together (2*n_ff outputs); the fused "
+                 "SwiGLU split is not implemented");
+            return VG_OK;
+        }
+    }
+    if (out->has_shared_expert && !out->is_moe) {
+        fail(out, VG_E_FORMAT, "blk.0.ffn_gate_shexp.weight",
+             "shared-expert tensors are present but the model declares no expert count");
+        return VG_OK;
+    }
+    if (out->logit_softcap == 0.0f) {
+        char sk[96];
+        int32_t cap = 0;
+        snprintf(sk, sizeof(sk), "%s.final_logit_softcap", arch);
+        if (meta_int(file, sk, &cap) && cap > 0) out->logit_softcap = (float)cap;
+    }
+    /* The architecture name alone is not the contract: the tensor layout has to be one
+     * this evaluator executes, which the layout checks above have just verified. */
+    if (!arch_supported(arch)) {
+        char list[256];
+        size_t off = 0;
+        for (size_t i = 0; i < sizeof(k_archs) / sizeof(k_archs[0]) && off < sizeof(list); ++i)
+            off += (size_t)snprintf(list + off, sizeof(list) - off, "%s%s",
+                                    i ? ", " : "", k_archs[i]);
+        fail(out, VG_E_UNSUPPORTED, NULL,
+             "architecture '%s' is not implemented (supported: %s)", arch, list);
         return VG_OK;
     }
 
@@ -271,11 +324,14 @@ VG_Status vg_model_probe(VG_GGUF *file, VG_ModelProbe *out) {
 
     /* Everything the evaluator will dispatch. */
     snprintf(out->required_ops, sizeof(out->required_ops),
-             "matmul[%u types], rmsnorm, rope(n_rot=%u), softmax%s%s%s%s",
+             "matmul[%u types], rmsnorm, rope(n_rot=%u), softmax%s%s%s%s%s%s%s",
              out->n_quant_kinds, out->n_rot,
              out->has_qk_norm ? ", qk_norm" : "",
              out->has_bias ? ", bias_add" : "",
              out->has_sub_norm ? ", sub_norm" : "",
+             out->has_post_norm ? ", post_norm" : "",
+             out->logit_softcap > 0.0f ? ", logit_softcap" : "",
+             out->has_shared_expert ? ", shared_expert" : "",
              out->is_moe ? ", moe_route, expert_matmul, expert_cache" : ", swiglu");
     return VG_OK;
 }
@@ -292,7 +348,7 @@ void vg_model_probe_report(const VG_ModelProbe *p, char *buf, size_t cap) {
              "geometry: layers=%u embd=%u heads=%u kv_heads=%u head_dim=%u ff=%u rot=%u ctx=%u vocab=%u\n"
              "experts: total=%u used=%u%s\n"
              "quant types: %s\n"
-             "features: tokenizer=%s bias=%s qk_norm=%s sub_norm=%s\n"
+             "features: tokenizer=%s bias=%s qk_norm=%s sub_norm=%s post_norm=%s shexp=%s softcap=%.0f\n"
              "ops: %s\n"
              "result: %s%s%s",
              p->arch, p->ok ? "" : "  [UNSUPPORTED]",
@@ -300,7 +356,8 @@ void vg_model_probe_report(const VG_ModelProbe *p, char *buf, size_t cap) {
              p->n_expert, p->n_expert_used, p->is_moe ? " (MoE)" : "",
              quants[0] ? quants : "(none)",
              p->has_tokenizer ? "yes" : "no", p->has_bias ? "yes" : "no", p->has_qk_norm ? "yes" : "no",
-             p->has_sub_norm ? "yes" : "no",
+             p->has_sub_norm ? "yes" : "no", p->has_post_norm ? "yes" : "no",
+             p->has_shared_expert ? "yes" : "no", (double)p->logit_softcap,
              /* Rejected models return before op resolution, so say so instead of printing nothing. */
              p->required_ops[0] ? p->required_ops : "(not analysed: rejected above)",
              p->ok ? "SUPPORTED" : "NOT SUPPORTED",

@@ -32,6 +32,13 @@ typedef struct VG_ModelConfig {
     int has_biases;
     int has_gate_up;
     int has_sub_norm;   /* BitNet b1.58 attn/ffn sub-norm RMSNorm weights */
+    /* Gemma 2/3 sandwich norms: attn_post_norm and ffn_post_norm normalise the block
+     * output before it is added to the residual. */
+    int has_post_norm;
+    /* MoE with an always-on shared expert (qwen2moe, deepseek-moe). */
+    int has_shared_expert;
+    float attn_logit_softcap;   /* pre-softmax cap (0 = off), gemma2 */
+    float logit_softcap;        /* final-logit cap (0 = off), gemma2 */
     int is_swa;
     uint32_t n_ctx;
     uint32_t n_expert;

@@ -9,7 +9,7 @@ build described at the bottom. Anything that could not be executed here is liste
 | Build | Command | Result |
 | --- | --- | --- |
 | Release, CPU + full engine | `cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DVG_ENABLE_VULKAN=OFF` | builds clean, 0 warnings from project sources |
-| Sanitizers | `cmake -S . -B build-asan -DVG_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=RelWithDebInfo -DVG_ENABLE_VULKAN=OFF` | 8/8 suites pass, no leaks |
+| Sanitizers | `cmake -S . -B build-asan -DVG_ENABLE_ASAN=ON -DCMAKE_BUILD_TYPE=Debug -DVG_ENABLE_VULKAN=OFF` | 8/8 suites pass, no leaks; six family fixtures also run clean under LSan |
 | Vulkan backend | `g++ -c src/vulkan_backend.cpp` against Vulkan-Headers 1.3.290 with the full warning set | compiles, 0 warnings |
 | Core-only | `-DVG_BUILD_FULL_ENGINE=OFF` | probe/inspect/tokenize/stream targets build |
 
@@ -28,6 +28,74 @@ scope, so `vg_full` (the generation engine) is checked too — a per-target list
 | `vg-sampler-tests` | Temperature/top-k/top-p and the additive repetition penalty | pass |
 | `vg-full-smoke` | `vg-run` on a synthetic dense model (exit status is the contract) | pass |
 | `vg-full-probe` | `vg-engine probe` reports SUPPORTED for that model | pass |
+
+## Model-family matrix
+
+Each family below was generated as a small GGUF from that architecture's real contract
+(metadata keys, tensor names, feature tensors, tokenizer kind), probed, decoded and
+generated from, then deleted — nothing is committed. Geometry is held constant
+(`n_embd=256`, 4 heads, 2 KV heads, head_dim 64, n_ff 256, 2 layers, 8 experts x 2 used),
+so a failure isolates the family's tensor contract rather than its size.
+
+| Family | Probe | Logits | Generates | Feature wiring |
+| --- | --- | --- | --- | --- |
+| llama-2 (SPM tokenizer) | SUPPORTED | finite | yes | — |
+| llama-3 (GPT-2 byte BPE) | SUPPORTED | finite | yes | — |
+| mistral (sliding window) | SUPPORTED | finite | yes | — |
+| tinyllama | SUPPORTED | finite | yes | — |
+| gemma | SUPPORTED | finite | yes | — |
+| gemma2 | SUPPORTED | finite | yes | attention + final softcap, post-norms: verified |
+| gemma3 | SUPPORTED | finite | yes | QK norm, post-norms: verified |
+| qwen2 | SUPPORTED | finite | yes | attention bias: verified (delta 4.0e-1) |
+| qwen3 | SUPPORTED | finite | yes | per-head QK norm: verified (6.0e-2) |
+| smollm | SUPPORTED | finite | yes | attention bias: verified (4.0e-1) |
+| bitnet b1.58 (TQ2_0) | SUPPORTED | finite | yes | attn/ffn sub-norms: verified (1.1e-2) |
+| mixtral (8 experts, top-2) | SUPPORTED | finite | yes | router + experts: verified (7.9e-2) |
+| qwen3-moe | SUPPORTED | finite | yes | router: verified (2.1e-2) |
+| qwen2-moe (shared expert) | SUPPORTED | finite | yes | router and shared expert: verified (4.7e-2) |
+| deepseek-moe (shared expert) | SUPPORTED | finite | yes | router and shared expert: verified (4.7e-2) |
+| phi3 | rejected | — | — | names the unsupported piece |
+| phi3, fused QKV + fused gate/up | rejected | — | — | `fused QKV projection (attn_qkv.weight) is not implemented` |
+| gpt2 | rejected | — | — | names the unsupported architecture |
+
+**Feature wiring** is a behavioural check, not a code reading: a second fixture perturbs
+exactly one feature tensor (attention bias, QK-norm weights, sub-norm weights, the MoE
+router, the shared-expert FFN) with *non-uniform* values and the logits must move by more
+than 1e-3 relative. Uniform scaling is deliberately avoided because the following RMSNorm
+cancels it, which would make an unimplemented feature look wired.
+
+Weight-type sweep on the same geometry (probe, finite logits and generation all pass):
+Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q4_K, Q6_K, TQ2_0, Q1_0, Q2_0, F16.
+
+### Defects this matrix found and fixed
+
+* **MoE experts were multiplied by a zeroed vector.** `moe_ffn_layer` normalised the block
+  input into `hidden`, then `memset(hidden, 0)` before the expert matvecs, so every expert
+  computed `W * 0` and the FFN block degenerated to the residual. The block input now lives
+  in its own `work_moe_in` buffer. Proof: routing logits changed with the router weights
+  while top-5 logits stayed bit-identical, and a zeroed-expert model produced exactly the
+  same output as the real one.
+* **MoE errors were swallowed.** `ffn_layer` discarded the status of `moe_ffn_layer`
+  (`(void)`), continuing on a half-written activation. `ffn_layer` now returns `VG_Status`
+  and `vg_model_graph_decode` propagates it.
+* **Attention bias was added after RoPE.** `attn_q.bias`/`attn_k.bias` were added to the
+  rotated vectors, which rotates the bias as well. Both are now added inside the projection,
+  before QK-norm and RoPE (qwen2/smollm were affected).
+* **gemma2/3 were reported SUPPORTED but not executed.** The sandwich post-norms
+  (`attn_post_norm`, `ffn_post_norm`) and the attention/final logit softcaps were ignored.
+  All three are implemented, and the probe now reports `post_norm`/`logit_softcap` in its
+  operator list.
+* **Shared experts were ignored.** `ffn_gate_shexp`/`ffn_up_shexp`/`ffn_down_shexp` were
+  never read, so qwen2-moe and deepseek-moe ran with only the routed experts. The
+  sigmoid-gated shared FFN is now part of the MoE block.
+* **Sliding window used the wrong metadata key.** Only `gemma4|llama|attention.sliding_window`
+  was read; the arch-prefixed key (`mistral.attention.sliding_window`) was missed.
+* **The probe accepted layouts the evaluator cannot execute.** Fused QKV (`attn_qkv`), fused
+  gate/up (`ffn_up` with `2*n_ff` outputs), MLA projections, learned positional embeddings
+  and convolutional attention are now refused by name instead of silently computing a
+  different model. The architecture message also lists the real supported set.
+* **Regression test added**: `vg-engine` writes a zero-expert MoE fixture and requires the
+  logits to differ from the real one. Before the fix they were bit-identical.
 
 ### What the engine tests actually assert
 

@@ -224,7 +224,7 @@ static void test_sentencepiece_space(const char *label, const VG_Tokenizer *tok)
     }
     size_t n = vg_tokenizer_vocab_size(tok);
     int leaked = 0, checked = 0;
-    char first[128];
+    char first[272];   /* "id=<n> leaked U+2581: " plus a full 128-byte token rendering */
     first[0] = 0;
     for (size_t id = 0; id < n && !leaked; ++id) {
         char buf[128];

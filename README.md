@@ -10,9 +10,11 @@ quantized matrix-vector work when a device and an SDK are available.
 | Capability | Status |
 | --- | --- |
 | GGUF v2/v3 parsing, metadata, typed tensor geometry | Yes — `vg-engine inspect` |
-| Dense llama-family models (llama, mistral, qwen2/3, gemma, smollm) | Yes — `vg-run` |
+| Dense llama-family models (llama, mistral, qwen2/3, gemma, gemma2/3, smollm, tinyllama) | Yes — `vg-run` |
+| Attention/FFN variants | per-head QK norm (qwen3, gemma3), attention bias in the projection (qwen2, smollm), gemma2/3 sandwich post-norms, attention and final logit softcapping, sliding-window attention |
 | BitNet b1.58 / ternary models (`bitnet` arch, `attn_sub_norm` + `ffn_sub_norm`, per-tensor `.scale`) | Yes — TQ2_0/TQ1_0/Q2_0/Q1_0 kernels, probe-validated |
-| MoE models (mixtral / qwen-moe blocks: router + stacked experts) | Yes — top-k routing with routing weights and an LRU expert cache |
+| MoE models (mixtral / qwen-moe blocks: router + stacked experts) | Yes — router projection, top-k routing weights, per-expert matvecs and an LRU expert cache |
+| MoE with an always-on shared expert (qwen2moe, deepseek-moe blocks) | Yes — sigmoid-gated shared FFN added to the routed sum |
 | CPU inference | Yes, row-parallel across all cores (`--threads N`, default = hardware) |
 | Vulkan inference | Q4_0, Q8_0 (dp4a), Q4_K, Q6_K, I8, F16, F32 matvec plus fused dense/MoE layer paths — see [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md) |
 | Large models | mmap + lazy paging; tensors are never copied whole |
@@ -22,7 +24,7 @@ quantized matrix-vector work when a device and an SDK are available.
 | Speculative decoding | `vg-engine spec MODEL [DRAFT] N`; distribution-correct `min(1, p/q)` acceptance with residual sampling |
 | Long context | Model context length, paged KV with optional sliding window |
 | Sampling | temperature, top-k, top-p, repeat penalty, deterministic seed |
-| Model validation | `vg-engine probe MODEL` — arch, geometry, quant types, required ops, exact failure |
+| Model validation | `vg-engine probe MODEL` — arch, geometry, quant types, required ops, exact failure; refuses layouts the evaluator does not execute (fused QKV/gate-up, MLA, learned positional embeddings) and names the tensor |
 | Tokenizers | SentencePiece BPE (llama/spm/gemma/bert, U+2581 marker, ranked merges, `<0xNN>` byte fallback) and GPT-2 byte-level BPE (U+0120 marker, byte remap) |
 
 ### Tokenizer notes

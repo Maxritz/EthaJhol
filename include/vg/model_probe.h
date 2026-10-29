@@ -35,6 +35,9 @@ typedef struct VG_ModelProbe {
     int has_bias;
     int has_qk_norm;
     int has_sub_norm;   /* BitNet b1.58 attn/ffn sub-norm weights present */
+    int has_post_norm;  /* gemma2/3 sandwich norms (attn_post_norm, ffn_post_norm) */
+    int has_shared_expert; /* MoE with an always-on shared expert */
+    float logit_softcap;   /* non-zero when the model caps final logits */
     int is_moe;
 
     /* Distinct quant types covering the required weight tensors. */

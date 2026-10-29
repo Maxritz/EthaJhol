@@ -46,6 +46,10 @@ struct VG_ModelGraph {
     uint32_t work_att_out_cap;
     float *work_head;
     float *work_res;
+    /* RMSNorm'd block input, kept separate from `hidden` because the MoE block
+     * accumulates its result into `hidden` while every expert matvec still needs the
+     * original input. Sharing one buffer made every expert multiply a zero vector. */
+    float *work_moe_in;
     float *logits;
     float *rope_freqs;  /* Optional: precomputed RoPE frequencies */
     uint32_t n_rope_freqs;
@@ -114,6 +118,9 @@ static int gpu_dense_ok(VG_ModelGraph *g) {
     const char *e = getenv("VG_GPU_ATTN"); if (e && e[0] == '0') return 0;
     if (!g->cfg.has_gate_up || g->cfg.has_biases) return 0;
     if (find_tensor(g, "blk.0.attn_q_norm.weight") || find_tensor(g, "blk.0.attn_k_norm.weight")) return 0;
+    /* The fused device layer does not implement the gemma2/3 sandwich norms or logit
+     * softcapping, so those models must stay on the per-op path. */
+    if (g->cfg.has_post_norm || g->cfg.attn_logit_softcap > 0.0f || g->cfg.logit_softcap > 0.0f) return 0;
     if (!find_tensor(g, "blk.0.ffn_gate.weight")) return 0;
     if (!find_tensor(g, "blk.0.attn_norm.weight") || !find_tensor(g, "blk.0.ffn_norm.weight")) return 0;
     if (g->cfg.n_head * g->cfg.head_dim != g->cfg.n_embd) return 0;
@@ -379,11 +386,26 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
     }
 
     {
+        /* The window is declared under the model's own architecture prefix, so a
+         * hardcoded key list silently fell back to 512 for every non-llama family. */
         int32_t sw = 0;
-        read_metadata_int(g, "gemma4.attention.sliding_window", &sw);
+        snprintf(key, sizeof(key), "%s.attention.sliding_window", arch);
+        read_metadata_int(g, key, &sw);
         if (sw <= 0) read_metadata_int(g, "llama.attention.sliding_window", &sw);
         if (sw <= 0) read_metadata_int(g, "attention.sliding_window", &sw);
         g->cfg.sliding_window = (sw > 0) ? (uint32_t)sw : 512;
+    }
+
+    /* Gemma 2/3 softcapping and sandwich norms. */
+    {
+        float cap = 0.0f;
+        snprintf(key, sizeof(key), "%s.attention.logit_softcap", arch);
+        if (read_metadata_float(g, key, &cap) == VG_OK && isfinite(cap) && cap > 0.0f)
+            g->cfg.attn_logit_softcap = cap;
+        cap = 0.0f;
+        snprintf(key, sizeof(key), "%s.final_logit_softcap", arch);
+        if (read_metadata_float(g, key, &cap) == VG_OK && isfinite(cap) && cap > 0.0f)
+            g->cfg.logit_softcap = cap;
     }
 
     if (getenv("VG_DEBUG")) fprintf(stderr, "[vg] %s: n_vocab=%u n_embd=%u n_head=%u n_head_kv=%u n_layer=%u n_ff=%u head_dim=%u n_rot=%u n_ctx=%u rms_eps=%.2e freq_base=%.1f\n",
@@ -403,6 +425,10 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
         /* BitNet b1.58 ships attn/ffn sub-norm RMSNorm weights; their presence is the
          * only portable marker of the extra norms. */
         g->cfg.has_sub_norm = find_tensor(g, "blk.0.attn_sub_norm.weight") != NULL;
+        g->cfg.has_post_norm = find_tensor(g, "blk.0.attn_post_norm.weight") != NULL &&
+                                find_tensor(g, "blk.0.ffn_post_norm.weight") != NULL;
+        g->cfg.has_shared_expert = find_tensor(g, "blk.0.ffn_gate_shexp.weight") != NULL &&
+                                   find_tensor(g, "blk.0.ffn_down_shexp.weight") != NULL;
     }
 
     if (g->cfg.n_expert == 0) g->cfg.n_expert = 1;
@@ -424,10 +450,12 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
     g->work_att_out_cap = g->cfg.n_head * h_dim + 1;
     g->work_head = (float *)malloc(g->cfg.head_dim * sizeof(float));
     g->work_res = (float *)malloc(embd_bytes);
+    g->work_moe_in = (float *)malloc(embd_bytes);
     g->logits = (float *)malloc(logits_bytes);
-    if (!g->work_embd || !g->work_ffn || !g->work_qkv || !g->work_att_out || !g->work_head || !g->work_res || !g->logits) {
+    if (!g->work_embd || !g->work_ffn || !g->work_qkv || !g->work_att_out || !g->work_head || !g->work_res || !g->work_moe_in || !g->logits) {
         free(g->work_embd); free(g->work_ffn); free(g->work_qkv);
         free(g->work_att_out); free(g->work_head); free(g->work_res);
+        free(g->work_moe_in);
         free(g->logits);
         free(g); return VG_E_NOMEM;
     }
@@ -442,6 +470,7 @@ VG_Status vg_model_graph_load(VG_GGUF *file, VG_TensorSource *source, VG_ModelGr
             free(g->kv_k); free(g->kv_v); free(g->kv_dim);
             free(g->work_embd); free(g->work_ffn); free(g->work_qkv);
             free(g->work_att_out); free(g->work_head); free(g->work_res);
+            free(g->work_moe_in);
             free(g->logits);
         free(g);
         return VG_E_NOMEM;
@@ -479,6 +508,7 @@ void vg_model_graph_free(VG_ModelGraph *g) {
     if (!g) return;
     free(g->work_embd); free(g->work_ffn); free(g->work_qkv);
     free(g->work_att_out); free(g->work_head); free(g->work_res);
+    free(g->work_moe_in);
     free(g->logits);
     free(g->rope_freqs);
     if (g->kv_k) {
@@ -641,6 +671,20 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, q_proj, Q_dim, D); }
         }
         if (!qkv_gpu) lora_apply(g, name, g->work_embd, q_proj, Q_dim, D);
+        /* Qwen2/SmolLM-style attention biases belong to the projection, so they must be
+         * added before q_norm/RoPE. Adding them afterwards rotated the bias as well. */
+        if (g->cfg.has_biases) {
+            char qb[160];
+            snprintf(qb, sizeof(qb), "blk.%u.attn_q.bias", layer);
+            VG_TensorLease lb; memset(&lb, 0, sizeof(lb));
+            if (acquire_weight(g, qb, &lb) == VG_OK) {
+                if (lb.tensor->ggml_type == VG_QUANT_F32 && lb.tensor->dims[0] >= Q_dim) {
+                    const float *bias = (const float *)lb.data;
+                    for (uint32_t i = 0; i < Q_dim; ++i) q_proj[i] += bias[i];
+                }
+                release_weight(&lb);
+            }
+        }
         if (vg_dump_on() && layer == 0 && pos <= 1) {
             fprintf(stderr, "[vg] DUMP q0");
             for (uint32_t di = 0; di < Q_dim; ++di) fprintf(stderr, " %.7g", q_proj[di]);
@@ -677,15 +721,6 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
     }
     release_weight(&l);
 
-    if (g->cfg.has_biases) {
-        snprintf(name, sizeof(name), "blk.%u.attn_q.bias", layer);
-        if (acquire_weight(g, name, &l) == VG_OK) {
-            const float *bias = (const float *)l.data;
-            for (uint32_t i = 0; i < Q_dim; ++i) g->work_qkv[i] += bias[i];
-            release_weight(&l);
-        }
-    }
-
     snprintf(name, sizeof(name), "blk.%u.attn_k.weight", layer);
     if (acquire_weight(g, name, &l) == VG_OK) {
         uint32_t kdim = (l.tensor->n_dims >= 2 && l.tensor->dims[1] >= 1) ? (uint32_t)l.tensor->dims[1] : KV_dim;
@@ -699,6 +734,18 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, k_full, KV_dim, D); }
             }
             if (!qkv_gpu) lora_apply(g, name, g->work_embd, k_full, KV_dim, D);
+            if (g->cfg.has_biases) {
+                char kb[160];
+                snprintf(kb, sizeof(kb), "blk.%u.attn_k.bias", layer);
+                VG_TensorLease lb; memset(&lb, 0, sizeof(lb));
+                if (acquire_weight(g, kb, &lb) == VG_OK) {
+                    if (lb.tensor->ggml_type == VG_QUANT_F32 && lb.tensor->dims[0] >= KV_dim) {
+                        const float *bias = (const float *)lb.data;
+                        for (uint32_t i = 0; i < KV_dim; ++i) k_full[i] += bias[i];
+                    }
+                    release_weight(&lb);
+                }
+            }
             if (vg_dump_on() && layer == 0 && pos == 0) fprintf(stderr, "[vg] Kcur-0 = [%.4f, %.4f, %.4f]\n", k_full[0], k_full[1], k_full[2]);
             uint32_t k_hdim = HKV ? (KV_dim / HKV) : HD;
             for (uint32_t h = 0; h < HKV; ++h) {
@@ -728,15 +775,6 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
         release_weight(&l);
     }
 
-    if (g->cfg.has_biases && k_full) {
-        snprintf(name, sizeof(name), "blk.%u.attn_k.bias", layer);
-        if (acquire_weight(g, name, &l) == VG_OK) {
-            const float *bias = (const float *)l.data;
-            for (uint32_t i = 0; i < KV_dim; ++i) k_full[i] += bias[i];
-            release_weight(&l);
-        }
-    }
-
     snprintf(name, sizeof(name), "blk.%u.attn_v.weight", layer);
     if (acquire_weight(g, name, &l) == VG_OK) {
         uint32_t vdim = (l.tensor->n_dims >= 2 && l.tensor->dims[1] >= 1) ? (uint32_t)l.tensor->dims[1] : KV_dim;
@@ -750,18 +788,21 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_embd, v_full, KV_dim, D); }
             if (!qkv_gpu) lora_apply(g, name, g->work_embd, v_full, KV_dim, D);
             }
+            if (g->cfg.has_biases) {
+                char vb[160];
+                snprintf(vb, sizeof(vb), "blk.%u.attn_v.bias", layer);
+                VG_TensorLease lb; memset(&lb, 0, sizeof(lb));
+                if (acquire_weight(g, vb, &lb) == VG_OK) {
+                    if (lb.tensor->ggml_type == VG_QUANT_F32 && lb.tensor->dims[0] >= KV_dim) {
+                        const float *bias = (const float *)lb.data;
+                        for (uint32_t i = 0; i < KV_dim; ++i) v_full[i] += bias[i];
+                    }
+                    release_weight(&lb);
+                }
+            }
             if (vg_dump_on() && layer == 0 && pos == 0) fprintf(stderr, "[vg] Vcur-0 = [%.4f, %.4f, %.4f]\n", v_full[0], v_full[1], v_full[2]);
         }
         release_weight(&l);
-    }
-
-    if (g->cfg.has_biases && v_full) {
-        snprintf(name, sizeof(name), "blk.%u.attn_v.bias", layer);
-        if (acquire_weight(g, name, &l) == VG_OK) {
-            const float *bias = (const float *)l.data;
-            for (uint32_t i = 0; i < KV_dim; ++i) v_full[i] += bias[i];
-            release_weight(&l);
-        }
     }
 
     uint32_t page_tokens = 64;
@@ -815,6 +856,11 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
             float dot = 0.0f;
             if (hk) { for (uint32_t d = 0; d < HD; ++d) dot += hq[d] * hk[d]; }
             scores[t] = dot * scale;
+            /* gemma2 caps attention logits before the softmax. */
+            if (g->cfg.attn_logit_softcap > 0.0f) {
+                const float c = g->cfg.attn_logit_softcap;
+                scores[t] = c * tanhf(scores[t] / c);
+            }
         }
         if (vg_dump_on() && layer == 0 && pos == 4 && h == 0) {
             fprintf(stderr, "[vg] scs");
@@ -874,6 +920,18 @@ static void attention_layer(VG_ModelGraph *g, uint32_t layer, float *hidden, flo
 #endif
             { vg_cpu_matmul(l.tensor->ggml_type, l.data, g->work_att_out, po, D, attn_dim); }
             lora_apply(g, name, g->work_att_out, po, D, attn_dim);
+            /* Gemma 2/3: the projected attention output is normalised before it joins
+             * the residual stream (sandwich norm), not after. */
+            if (g->cfg.has_post_norm) {
+                char pn[160];
+                snprintf(pn, sizeof(pn), "blk.%u.attn_post_norm.weight", layer);
+                VG_TensorLease pnl; memset(&pnl, 0, sizeof(pnl));
+                if (acquire_weight(g, pn, &pnl) == VG_OK) {
+                    if (pnl.tensor->n_dims == 1 && pnl.tensor->dims[0] == D)
+                        vg_cpu_rmsnorm(po, po, (const float *)pnl.data, D, g->cfg.rms_eps);
+                    release_weight(&pnl);
+                }
+            }
             for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + po[i];
             free(po);
         }
@@ -906,27 +964,32 @@ static void route_weights(const float *logits, const uint32_t *ids, uint32_t n_u
 }
 
 /* Mixture-of-experts block: router projection -> top-k -> per-expert gate/up/swiglu/down
- * over the stacked expert tensors, weighted sum, then the residual. */
+ * over the stacked expert tensors, weighted sum, then the residual.
+ *
+ * The normalised block input lives in work_moe_in, not in `hidden`: `hidden` is the
+ * accumulator, so using it as the matvec input meant the memset below zeroed the vector
+ * every expert was about to multiply, and all experts contributed exactly nothing. */
 static VG_Status moe_ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
     const uint32_t D = g->cfg.n_embd;
     const uint32_t FF = g->cfg.n_ff;
     char name[160];
     VG_TensorLease l;
+    float *xin = g->work_moe_in ? g->work_moe_in : g->work_embd;
 
     memcpy(g->work_res, hidden, D * sizeof(float));
     snprintf(name, sizeof(name), "blk.%u.ffn_norm.weight", layer);
     if (acquire_weight(g, name, &l) == VG_OK) {
-        vg_cpu_rmsnorm(g->work_embd, hidden, (const float *)l.data, D, g->cfg.rms_eps);
+        vg_cpu_rmsnorm(xin, hidden, (const float *)l.data, D, g->cfg.rms_eps);
         release_weight(&l);
     } else {
-        memcpy(g->work_embd, hidden, D * sizeof(float));
+        memcpy(xin, hidden, D * sizeof(float));
     }
 
     /* Router logits from the block input (llama.cpp convention: post-norm input). */
     snprintf(name, sizeof(name), "blk.%u.ffn_gate_inp.weight", layer);
     VG_Status st = acquire_weight(g, name, &l);
     if (st != VG_OK) return st;
-    st = mm_dispatch(g, l.data, l.size, l.tensor->ggml_type, g->work_embd, g->route_logits, g->cfg.n_expert, D);
+    st = mm_dispatch(g, l.data, l.size, l.tensor->ggml_type, xin, g->route_logits, g->cfg.n_expert, D);
     release_weight(&l);
     if (st != VG_OK) return st;
 
@@ -952,9 +1015,9 @@ static VG_Status moe_ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) 
         if (st != VG_OK) return st;
         st = acquire_expert(g, layer, VG_EXPERT_UP, e, FF, D, &wup, &bup, &tup);
         if (st != VG_OK) return st;
-        st = mm_dispatch(g, wgate, bgate, tgate, g->work_embd, g->expert_gate, FF, D);
+        st = mm_dispatch(g, wgate, bgate, tgate, xin, g->expert_gate, FF, D);
         if (st != VG_OK) return st;
-        st = mm_dispatch(g, wup, bup, tup, g->work_embd, g->expert_up, FF, D);
+        st = mm_dispatch(g, wup, bup, tup, xin, g->expert_up, FF, D);
         if (st != VG_OK) return st;
         vg_cpu_swiglu(g->expert_gate, g->expert_gate, g->expert_up, FF);
         st = acquire_expert(g, layer, VG_EXPERT_DOWN, e, D, FF, &wdown, &bdown, &tdown);
@@ -964,18 +1027,69 @@ static VG_Status moe_ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) 
         const float w = weights[i];
         for (uint32_t j = 0; j < D; ++j) hidden[j] += w * g->expert_down[j];
     }
+
+    /* Always-on shared expert (qwen2moe, deepseek-moe). It is not part of the top-k
+     * selection: a scalar projector gates its output into the same sum. */
+    if (g->cfg.has_shared_expert) {
+        char sg[160], su[160], sd[160], sn[160];
+        snprintf(sg, sizeof(sg), "blk.%u.ffn_gate_shexp.weight", layer);
+        snprintf(su, sizeof(su), "blk.%u.ffn_up_shexp.weight", layer);
+        snprintf(sd, sizeof(sd), "blk.%u.ffn_down_shexp.weight", layer);
+        snprintf(sn, sizeof(sn), "blk.%u.ffn_gate_inp_shexp.weight", layer);
+        VG_TensorLease lg, lu, ld, ln;
+        memset(&lg, 0, sizeof(lg)); memset(&lu, 0, sizeof(lu));
+        memset(&ld, 0, sizeof(ld)); memset(&ln, 0, sizeof(ln));
+        float gate = 1.0f;
+        if (acquire_weight(g, sn, &ln) == VG_OK) {
+            if (ln.tensor->ggml_type == VG_QUANT_F32 && ln.tensor->n_dims == 1 && ln.tensor->dims[0] == D) {
+                const float *gw = (const float *)ln.data;
+                float acc = 0.0f;
+                for (uint32_t j = 0; j < D; ++j) acc += gw[j] * xin[j];
+                gate = 1.0f / (1.0f + expf(-acc));
+            }
+            release_weight(&ln);
+        }
+        if (acquire_weight(g, sg, &lg) == VG_OK && acquire_weight(g, su, &lu) == VG_OK) {
+            if (mm_dispatch(g, lg.data, lg.size, lg.tensor->ggml_type, xin, g->expert_gate, FF, D) == VG_OK &&
+                mm_dispatch(g, lu.data, lu.size, lu.tensor->ggml_type, xin, g->expert_up, FF, D) == VG_OK) {
+                vg_cpu_swiglu(g->expert_gate, g->expert_gate, g->expert_up, FF);
+                if (acquire_weight(g, sd, &ld) == VG_OK) {
+                    if (mm_dispatch(g, ld.data, ld.size, ld.tensor->ggml_type, g->expert_gate,
+                                    g->expert_down, D, FF) == VG_OK)
+                        for (uint32_t j = 0; j < D; ++j) hidden[j] += gate * g->expert_down[j];
+                    release_weight(&ld);
+                }
+            }
+        }
+        release_weight(&lg);
+        release_weight(&lu);
+    }
+
+    if (g->cfg.has_post_norm) {
+        char pn[160];
+        snprintf(pn, sizeof(pn), "blk.%u.ffn_post_norm.weight", layer);
+        VG_TensorLease pnl;
+        memset(&pnl, 0, sizeof(pnl));
+        if (acquire_weight(g, pn, &pnl) == VG_OK) {
+            if (pnl.tensor->n_dims == 1 && pnl.tensor->dims[0] == D)
+                vg_cpu_rmsnorm(hidden, hidden, (const float *)pnl.data, D, g->cfg.rms_eps);
+            release_weight(&pnl);
+        }
+    }
     for (uint32_t j = 0; j < D; ++j) hidden[j] += g->work_res[j];
     return VG_OK;
 }
-static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
+static VG_Status ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
     uint32_t D = g->cfg.n_embd;
     uint32_t FF = g->cfg.n_ff;
     char name[128];
     VG_TensorLease l;
 
     /* MoE models take the routed expert path; the dense path below would read
-     * blk.N.ffn_gate.weight, which only exists for dense architectures. */
-    if (g->cfg.n_expert > 1) { (void)moe_ffn_layer(g, layer, hidden); return; }
+     * blk.N.ffn_gate.weight, which only exists for dense architectures. The status
+     * must reach the caller: swallowing it left a half-written activation behind and
+     * generation would continue on a corrupted hidden state. */
+    if (g->cfg.n_expert > 1) return moe_ffn_layer(g, layer, hidden);
 
     /* MoE fused head (COMPASS 3.1): attention_layer skipped its o_proj and left
      * attention in work_att_out and the pre-attention hidden in work_res.
@@ -1078,7 +1192,7 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
             }
         }
         release_weight(&lo); release_weight(&ln); release_weight(&lg); release_weight(&lu); release_weight(&ld);
-        if (did) return;
+        if (did) return VG_OK;
     }
 #endif
 
@@ -1212,7 +1326,7 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
         }
         free(logits); free(gate_out); free(up_out); free(down_out); free(acc);
         free(moe_logits);
-        return;
+        return VG_OK;
     }
 
     if (g->cfg.has_gate_up) {
@@ -1233,7 +1347,7 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
                     float *fout = (float *)malloc((size_t)D * sizeof(float)); VG_Status fst = VG_E_UNSUPPORTED;
                     fst = fout ? vg_vk_ffn_fused(g->vk, gw, gs, uw, us, dw, ds, g->work_embd, fout, D, FF) : VG_E_NOMEM; if (fst == VG_OK) {
                         for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + fout[i];
-                        free(fout); release_weight(&fg); release_weight(&fu); release_weight(&fd); return;
+                        free(fout); release_weight(&fg); release_weight(&fu); release_weight(&fd); return VG_OK;
                     }
                     free(fout);
                 }
@@ -1323,11 +1437,22 @@ static void ffn_layer(VG_ModelGraph *g, uint32_t layer, float *hidden) {
             }
             lora_apply(g, name, g->work_ffn, down_out, D, FF);
             if (vg_dump_on() && layer == 0) fprintf(stderr, "[vg] dn0 %.4f %.4f\n", down_out[0], down_out[1]);
+            if (g->cfg.has_post_norm) {
+                char pn[160];
+                snprintf(pn, sizeof(pn), "blk.%u.ffn_post_norm.weight", layer);
+                VG_TensorLease pnl; memset(&pnl, 0, sizeof(pnl));
+                if (acquire_weight(g, pn, &pnl) == VG_OK) {
+                    if (pnl.tensor->n_dims == 1 && pnl.tensor->dims[0] == D)
+                        vg_cpu_rmsnorm(down_out, down_out, (const float *)pnl.data, D, g->cfg.rms_eps);
+                    release_weight(&pnl);
+                }
+            }
             for (uint32_t i = 0; i < D; ++i) hidden[i] = g->work_res[i] + down_out[i];
             free(down_out);
         }
         release_weight(&l);
     }
+    return VG_OK;
 }
 
 VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t kv_pos, float *logits_out) {
@@ -1427,7 +1552,10 @@ VG_Status vg_model_graph_decode(VG_ModelGraph *g, int32_t input_token, int32_t k
         if (vg_dump_on() && (l == 0 || l == g->cfg.n_layer - 1)) {
             fprintf(stderr, "[vg] at%u [%.6f %.6f %.6f %.6f]\n", l, g->work_embd[0], g->work_embd[1], g->work_embd[2], g->work_embd[3]);
         }
-        ffn_layer(g, l, g->work_embd);
+        {
+            VG_Status fst = ffn_layer(g, l, g->work_embd);
+            if (fst != VG_OK) return fst;
+        }
         uint64_t ta2 = vg_trace_now_ns();
         if (vg_dump_on() && (l == 0 || l == 7 || l == g->cfg.n_layer - 1)) {
             fprintf(stderr, "[vg] hl%u [%.5f %.5f %.5f %.5f]\n", l, g->work_embd[0], g->work_embd[1], g->work_embd[2], g->work_embd[3]);
@@ -1521,6 +1649,12 @@ after_layers: ;
 #ifdef VG_HAS_VULKAN
 logits_ready:
 #endif
+    /* gemma2 squashes the final logits into (-cap, cap); the probe/sampler must see the
+     * capped values, otherwise the distribution differs from the reference model. */
+    if (g->cfg.logit_softcap > 0.0f) {
+        const float c = g->cfg.logit_softcap;
+        for (uint32_t vi = 0; vi < g->cfg.n_vocab; ++vi) g->logits[vi] = c * tanhf(g->logits[vi] / c);
+    }
     if (vg_dump_on()) { float bv = -1e18f; int32_t bi = -1; for (uint32_t vi = 0; vi < g->cfg.n_vocab; ++vi) if (g->logits[vi] > bv) { bv = g->logits[vi]; bi = (int32_t)vi; } fprintf(stderr, "[vg] lg top=%d %.4f [%.4f %.4f %.4f %.4f]\n", bi, bv, g->logits[0], g->logits[1], g->logits[2], g->logits[3]); }
     if (logits_out) memcpy(logits_out, g->logits, g->cfg.n_vocab * sizeof(float));
     return VG_OK;

@@ -173,8 +173,10 @@ static void add_q4(Writer *w, const char *name, uint32_t in_dim, uint32_t out_di
     fill_q4_0(t->payload, (size_t)in_dim * out_dim, seed);
 }
 
-static void add_q4_experts(Writer *w, const char *name, uint32_t in_dim, uint32_t out_dim,
-                           uint32_t n_expert, uint32_t seed) {
+/* `zero` leaves every expert weight at 0: a forward pass that ignores the expert tensors
+ * (they used to be multiplied by a zeroed input vector) then returns identical logits. */
+static void add_q4_experts_ex(Writer *w, const char *name, uint32_t in_dim, uint32_t out_dim,
+                              uint32_t n_expert, uint32_t seed, int zero) {
     FixTensor *t = &w->t[w->n_tensors++];
     snprintf(t->name, sizeof(t->name), "%s", name);
     t->n_dims = 3;
@@ -183,6 +185,7 @@ static void add_q4_experts(Writer *w, const char *name, uint32_t in_dim, uint32_
     t->bytes = (size_t)n_expert * out_dim * (in_dim / 32u) * 18u;
     t->payload = (unsigned char *)calloc(1, t->bytes);
     if (!t->payload) { fprintf(stderr, "fixture: out of memory\n"); exit(1); }
+    if (zero) return;
     for (uint32_t e = 0; e < n_expert; ++e)
         fill_q4_0(t->payload + (size_t)e * out_dim * (in_dim / 32u) * 18u,
                   (size_t)in_dim * out_dim, seed + e * 31u);
@@ -451,7 +454,7 @@ int vg_fixture_write_lora(const char *path) {
     return rc;
 }
 
-int vg_fixture_write_moe(const char *path) {
+static int write_moe(const char *path, int zero_experts) {
     Writer w;
     init_writer(&w);
     const uint32_t D = VG_FIX_MOE_EMBD, H = VG_FIX_MOE_HEADS, KV = VG_FIX_MOE_KV;
@@ -481,11 +484,16 @@ int vg_fixture_write_moe(const char *path) {
         for (uint32_t e = 0; e < E; ++e)
             for (uint32_t i = 0; i < D; ++i) p[e * D + i] = (float)(e + 1) / 10.0f;
     }
-    add_q4_experts(&w, "blk.0.ffn_gate_exps.weight", D, FF, E, 50);
-    add_q4_experts(&w, "blk.0.ffn_up_exps.weight", D, FF, E, 60);
-    add_q4_experts(&w, "blk.0.ffn_down_exps.weight", FF, D, E, 70);
+    add_q4_experts_ex(&w, "blk.0.ffn_gate_exps.weight", D, FF, E, 50, zero_experts);
+    add_q4_experts_ex(&w, "blk.0.ffn_up_exps.weight", D, FF, E, 60, zero_experts);
+    add_q4_experts_ex(&w, "blk.0.ffn_down_exps.weight", FF, D, E, 70, zero_experts);
     layout(&w);
     int rc = write_file(&w, path);
     free_writer(&w);
     return rc;
 }
+
+int vg_fixture_write_moe(const char *path) { return write_moe(path, 0); }
+
+/* Same model, expert weights all zero. */
+int vg_fixture_write_moe_zero(const char *path) { return write_moe(path, 1); }
