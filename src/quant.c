@@ -371,9 +371,10 @@ static void deq_q2_0(const unsigned char *src, float *y, size_t nb) {
     for (size_t b = 0; b < nb; ++b) {
         const block_q2_0 *q = (const block_q2_0 *)(src + b * 18u);
         const float d = vg_half_to_float(q->d);
-        for (int j = 0; j < 64; ++j) {
-            const int v = (int)((q->qs[j / 4] >> ((j % 4) * 2)) & 3u);
-            y[b * 64 + (size_t)j] = (float)(v - 1) * d;
+        float *out = y + b * 64u;
+        for (size_t j = 0; j < 64u; ++j) {
+            const int v = (int)(((unsigned)q->qs[j / 4u] >> ((j % 4u) * 2u)) & 3u);
+            out[j] = (float)(v - 1) * d;
         }
     }
 }

@@ -51,10 +51,10 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
         if (tmp) {
             memcpy(tmp, probs, n_vocab * sizeof(float));
             for (int32_t i = 0; i < top_k; ++i) {
-                int32_t mi = i; for (uint32_t j = i + 1; j < n_vocab; ++j) if (tmp[j] > tmp[mi]) mi = (int32_t)j;
+                int32_t mi = i; for (uint32_t j = (uint32_t)i + 1u; j < n_vocab; ++j) if (tmp[j] > tmp[mi]) mi = (int32_t)j;
                 float t = tmp[i]; tmp[i] = tmp[mi]; tmp[mi] = t;
             }
-            float thresh = tmp[top_k - 1]; free(tmp);
+            float thresh = tmp[(size_t)top_k - 1u]; free(tmp);
             for (uint32_t i = 0; i < n_vocab; ++i) if (probs[i] < thresh) probs[i] = 0.0f;
         }
     }
@@ -166,7 +166,7 @@ static int cpu_infer(const char *path, const char *prompt) {
     /* Generate up to 128 tokens */
     uint32_t rng_state = 42u;
     int32_t repeat_last_n = 64;
-    int32_t *repeat_buf = (int32_t *)calloc(repeat_last_n, sizeof(int32_t));
+    int32_t *repeat_buf = (int32_t *)calloc((size_t)repeat_last_n, sizeof(int32_t));
     int32_t repeat_count = 0;
     for (int gi = 0; gi < 128; ++gi) {
         int32_t best = sample_token(logits, mc->n_vocab, 0.7f, 40, 0.95f, 1.1f,
@@ -175,7 +175,7 @@ static int cpu_infer(const char *path, const char *prompt) {
         char buf[256]; vg_tokenizer_decode(tok, best, buf, sizeof(buf));
         printf("%s", buf); fflush(stdout);
         if (repeat_count < repeat_last_n) { repeat_buf[repeat_count++] = best; }
-        else { memmove(repeat_buf, repeat_buf + 1, (repeat_last_n - 1) * sizeof(int32_t)); repeat_buf[repeat_last_n - 1] = best; }
+        else { memmove(repeat_buf, repeat_buf + 1, ((size_t)repeat_last_n - 1u) * sizeof(int32_t)); repeat_buf[repeat_last_n - 1] = best; }
         st = vg_model_graph_decode(graph, best, kv_pos, logits);
         if (st != VG_OK) { fprintf(stderr, "\ngenerate decode failed at pos %d: %s\n", kv_pos, status_name(st)); break; }
         ++kv_pos;
@@ -234,7 +234,7 @@ static int vk_infer(const char *path, const char *prompt) {
     /* Generate up to 128 tokens */
     uint32_t rng_state = 42u;
     int32_t repeat_last_n = 64;
-    int32_t *repeat_buf = (int32_t *)calloc(repeat_last_n, sizeof(int32_t));
+    int32_t *repeat_buf = (int32_t *)calloc((size_t)repeat_last_n, sizeof(int32_t));
     int32_t repeat_count = 0;
     for (int gi = 0; gi < 128; ++gi) {
         int32_t best = sample_token(logits, mc->n_vocab, 0.7f, 40, 0.95f, 1.1f,
@@ -243,7 +243,7 @@ static int vk_infer(const char *path, const char *prompt) {
         char buf[256]; vg_tokenizer_decode(tok, best, buf, sizeof(buf));
         printf("%s", buf); fflush(stdout);
         if (repeat_count < repeat_last_n) { repeat_buf[repeat_count++] = best; }
-        else { memmove(repeat_buf, repeat_buf + 1, (repeat_last_n - 1) * sizeof(int32_t)); repeat_buf[repeat_last_n - 1] = best; }
+        else { memmove(repeat_buf, repeat_buf + 1, ((size_t)repeat_last_n - 1u) * sizeof(int32_t)); repeat_buf[repeat_last_n - 1] = best; }
         st = vg_model_graph_decode(graph, best, kv_pos, logits);
         if (st != VG_OK) { fprintf(stderr, "\ngenerate decode failed at pos %d: %s\n", kv_pos, status_name(st)); break; }
         ++kv_pos;

@@ -363,10 +363,12 @@ static void rows_q2_0(const void *W, const float *x, float *y, uint32_t r0, uint
 }
 
 static uint8_t get_scale_k4(int j, const uint8_t *q) {
-    return j < 4 ? (uint8_t)(q[j] & 63u) : (uint8_t)((q[j + 4] & 0x0Fu) | ((q[j - 4] >> 6) << 4));
+    const int hi = j < 4 ? (int)(q[j] & 63u) : (int)((q[j + 4] & 0x0Fu) | (((unsigned)q[j - 4] >> 6) << 4));
+    return (uint8_t)hi;
 }
 static uint8_t get_min_k4(int j, const uint8_t *q) {
-    return j < 4 ? (uint8_t)(q[j + 4] & 63u) : (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
+    const int hi = j < 4 ? (int)(q[j + 4] & 63u) : (int)((q[j + 4] >> 4) | (((unsigned)q[j] >> 6) << 4));
+    return (uint8_t)hi;
 }
 
 /* Two rows per pass, same interleaving trick as Q4_0: twice the independent accumulator chains

@@ -53,7 +53,7 @@ The kernel therefore optimises bytes moved and instruction dependency, not FLOPs
 
 * weights stay packed; no dequantized matrix is ever materialized;
 * one packed byte feeds every plane it encodes (the TQ2_0 kernel loads each byte once and runs
-  four accumulator chains from it — this alone took TQ2_0 from 7.9 ms to 3.1 ms per matvec);
+  four accumulator chains from it — this alone took TQ2_0 from 7.9 ms to 3.4 ms per matvec);
 * two-row interleaving for Q4_0/Q4_K gives the scheduler an independent chain while the nibbles
   of the first row unpack;
 * `__builtin_prefetch` one block ahead on the weight stream;

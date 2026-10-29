@@ -24,7 +24,10 @@ endif()
 if(MSVC)
   add_compile_options(/W4)
 else()
-  add_compile_options(-Wall -Wextra -Wshadow -Wpedantic)
+  # -Wconversion belongs in this list, not only on vg_core: the engine itself (main.c,
+  # native_engine.c, lora.c, speculative.c) narrows sizes and indices too, and it was the
+  # last place a sign-changing conversion could hide.
+  add_compile_options(-Wall -Wextra -Wconversion -Wshadow -Wpedantic)
 endif()
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -44,7 +47,7 @@ endif()
 if(MSVC)
   target_compile_options(vg_core PRIVATE /W4)
 else()
-  target_compile_options(vg_core PRIVATE -Wall -Wextra -Wconversion -Wshadow -Wpedantic)
+  target_compile_options(vg_core PRIVATE -Wall -Wextra -Wshadow -Wpedantic)
 endif()
 
 if(VG_ENABLE_VULKAN)
@@ -84,8 +87,7 @@ if(VG_ENABLE_VULKAN)
     else()
       # Vulkan structs are aggregate-initialized with only sType set; the remaining fields are
       # zero-initialized by value-initialization, which is exactly what the API requires.
-      target_compile_options(vg_vulkan PRIVATE -Wall -Wextra -Wconversion -Wshadow -Wpedantic
-                             -Wno-missing-field-initializers)
+      target_compile_options(vg_vulkan PRIVATE -Wno-missing-field-initializers)
     endif()
     target_compile_definitions(vg_vulkan PUBLIC VG_HAS_VULKAN=1)
     target_compile_definitions(vg_core PRIVATE VG_HAS_VULKAN=1)
