@@ -435,13 +435,14 @@ static void test_lora_delta(const char *lora_path) {
 }
 
 /* --- 5. End-to-end decode --------------------------------------------------------- */
-static VG_ModelGraph *load_graph(const char *path, VG_GGUF **file, VG_TensorSource **src) {
+static VG_ModelGraph *load_graph_cfg(const char *path, VG_GGUF **file, VG_TensorSource **src,
+                                     int use_mmap, size_t host_budget) {
     if (vg_gguf_open(path, file) != VG_OK) return NULL;
     VG_TensorSourceConfig cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.host_budget_bytes = 32u * 1024u * 1024u;
+    cfg.host_budget_bytes = host_budget;
     cfg.io_chunk_bytes = 1u * 1024u * 1024u;
-    cfg.use_mmap = 1;
+    cfg.use_mmap = use_mmap;
     if (vg_tensor_source_open(*file, &cfg, src) != VG_OK) {
         vg_gguf_close(*file); *file = NULL;
         return NULL;
@@ -453,6 +454,10 @@ static VG_ModelGraph *load_graph(const char *path, VG_GGUF **file, VG_TensorSour
         return NULL;
     }
     return g;
+}
+
+static VG_ModelGraph *load_graph(const char *path, VG_GGUF **file, VG_TensorSource **src) {
+    return load_graph_cfg(path, file, src, 1, 32u * 1024u * 1024u);
 }
 
 static void test_dense_decode(const char *path) {
@@ -599,6 +604,59 @@ static void test_moe_routing(const char *path) {
     vg_model_graph_free(g);
     vg_tensor_source_close(src);
     vg_gguf_close(file);
+}
+
+/* The expert cache hands out pointers into a tensor it no longer holds a lease on. With mmap
+ * that is safe (the mapping outlives the lease), but a RAM-backed source is free to evict the
+ * tensor as soon as its refcount drops, leaving every cached slot dangling. Driven through a
+ * series of budgets so both backing modes are exercised: a tensor that fits the budget is
+ * cached and pinnable, one that does not arrives as a transient malloc that release frees.
+ * Logits must match the mmap reference exactly either way; under ASan a dangling slot is a
+ * use-after-free rather than a silently wrong number. */
+static void test_moe_expert_cache_lease(const char *path) {
+    static const size_t budgets[] = { 8u * 1024u, 12u * 1024u, 24u * 1024u, 32u * 1024u, 64u * 1024u };
+    VG_GGUF *rf = NULL; VG_TensorSource *rs = NULL;
+    VG_ModelGraph *ref = load_graph(path, &rf, &rs);
+    CHECK(ref != NULL);
+    if (!ref) return;
+    const VG_ModelConfig *cfg = vg_model_graph_config(ref);
+    float *ref_logits = (float *)malloc(cfg->n_vocab * sizeof(float));
+    float *logits = (float *)malloc(cfg->n_vocab * sizeof(float));
+    assert(ref_logits && logits);
+    vg_model_graph_reset(ref);
+    CHECK(vg_model_graph_decode(ref, cfg->bos_id, 0, ref_logits) == VG_OK);
+
+    for (size_t b = 0; b < sizeof(budgets) / sizeof(budgets[0]); ++b) {
+        VG_GGUF *f = NULL; VG_TensorSource *s = NULL;
+        VG_ModelGraph *g = load_graph_cfg(path, &f, &s, 0, budgets[b]);
+        CHECK(g != NULL);
+        if (!g) continue;
+        /* A cache too small for the working set forces both slot eviction and source eviction. */
+        CHECK(vg_model_graph_set_expert_cache(g, 4) == VG_OK);
+        vg_model_graph_reset(g);
+        CHECK(vg_model_graph_decode(g, cfg->bos_id, 0, logits) == VG_OK);
+        int identical = 1;
+        for (uint32_t i = 0; i < cfg->n_vocab; ++i) if (logits[i] != ref_logits[i]) identical = 0;
+        CHECK(identical);
+        /* More positions: repeated routing, slot churn, and eviction between acquires. */
+        for (int32_t pos = 1; pos < 6; ++pos) {
+            CHECK(vg_model_graph_decode(g, (int32_t)(pos % 4), pos, logits) == VG_OK);
+            int finite = 1;
+            for (uint32_t i = 0; i < cfg->n_vocab; ++i) if (!isfinite(logits[i])) finite = 0;
+            CHECK(finite);
+        }
+        uint64_t hits = 0, misses = 0, evictions = 0;
+        vg_model_graph_expert_stats(g, &hits, &misses, &evictions);
+        CHECK(misses > 0 && evictions > 0);
+        vg_model_graph_free(g);
+        vg_tensor_source_close(s);
+        vg_gguf_close(f);
+    }
+
+    free(logits); free(ref_logits);
+    vg_model_graph_free(ref);
+    vg_tensor_source_close(rs);
+    vg_gguf_close(rf);
 }
 
 #ifdef VG_TEST_FULL_ENGINE
@@ -894,6 +952,7 @@ int main(int argc, char **argv) {
     test_probe_unsupported(unsupported);
     test_dense_decode(dense);
     test_moe_routing(moe);
+    test_moe_expert_cache_lease(moe);
 #ifdef VG_TEST_FULL_ENGINE
     test_generate_end_to_end(dense);
     test_generate_rejects_unsupported(unsupported);

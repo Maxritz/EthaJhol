@@ -22,6 +22,13 @@ typedef struct VG_ExpertSlot {
     uint32_t in_dim;
     uint64_t last_use;
     uint32_t hits;
+    /* Backing that keeps `data` alive for as long as the slot exists. A cache-backed lease
+     * is pinned (its refcount is held, so the source cannot evict it); a transient lease
+     * would be freed by release, so its expert slice is copied into `owned` instead. Without
+     * one of the two the slot's pointer dangles as soon as another acquire evicts the tensor. */
+    VG_TensorLease lease;
+    int holds_lease;
+    unsigned char *owned;
 } VG_ExpertSlot;
 
 typedef struct VG_ExpertCache {
@@ -163,7 +170,18 @@ static void cache_init(VG_ExpertCache *c, uint32_t cap) {
     c->cap = c->slots ? cap : 0;
 }
 
-static void cache_free(VG_ExpertCache *c) { free(c->slots); memset(c, 0, sizeof(*c)); }
+/* Drop a slot's backing: release the pinned lease or free the owned copy. */
+static void slot_drop(VG_ExpertSlot *s) {
+    if (s->holds_lease) { release_weight(&s->lease); s->holds_lease = 0; }
+    free(s->owned);
+    s->owned = NULL;
+    s->data = NULL;
+}
+
+static void cache_free(VG_ExpertCache *c) {
+    for (uint32_t i = 0; i < c->count; ++i) slot_drop(&c->slots[i]);
+    free(c->slots); memset(c, 0, sizeof(*c));
+}
 
 static VG_ExpertSlot *cache_find(VG_ExpertCache *c, uint32_t layer, uint32_t expert, uint32_t kind) {
     for (uint32_t i = 0; i < c->count; ++i)
@@ -182,6 +200,7 @@ static VG_ExpertSlot *cache_insert(VG_ExpertCache *c, VG_ExpertSlot value) {
         idx = 0;
         for (uint32_t i = 1; i < c->count; ++i)
             if (c->slots[i].last_use < c->slots[idx].last_use) idx = i;
+        slot_drop(&c->slots[idx]);
         ++c->evictions;
     }
     value.last_use = ++c->clock;
@@ -199,8 +218,8 @@ static size_t expert_stride(const VG_GGUF_Tensor *t, uint32_t out_dim, uint32_t 
 }
 
 /* Resolve expert `e` of blk.N.<kind>_exps.weight, reusing the cached slice when the same
- * expert was used by an earlier token. The returned pointer is into the mmap'd tensor, so
- * the lease taken for the lookup is dropped before returning. */
+ * expert was used by an earlier token. The pointer handed back stays valid for as long as the
+ * slot does: the lease is either pinned in the slot or released after the slice is copied. */
 static VG_Status acquire_expert(VG_ModelGraph *g, uint32_t layer, uint32_t kind,
                                 uint32_t expert, uint32_t out_dim, uint32_t in_dim,
                                 const void **data, size_t *bytes, uint32_t *ggml_type) {
@@ -238,12 +257,25 @@ static VG_Status acquire_expert(VG_ModelGraph *g, uint32_t layer, uint32_t kind,
     value.ggml_type = lease.tensor->ggml_type;
     value.out_dim = out_dim;
     value.in_dim = in_dim;
+    /* A ticketed lease holds a source-cache ref (pinning it blocks eviction); a mapped lease
+     * points into the file mapping, which outlives the lease. Everything else is a transient
+     * malloc that release_weight() frees, so keep a private copy of just this expert's slice. */
+    if (lease.ticket || lease.mapped) {
+        value.lease = lease;
+        value.holds_lease = 1;
+    } else {
+        unsigned char *copy = (unsigned char *)malloc(stride ? stride : 1u);
+        if (!copy) { release_weight(&lease); return VG_E_NOMEM; }
+        memcpy(copy, value.data, stride);
+        value.data = copy;
+        value.owned = copy;
+        release_weight(&lease);
+    }
     ++g->cache.misses;
     (void)cache_insert(&g->cache, value);
     *data = value.data;
     if (bytes) *bytes = value.bytes;
     *ggml_type = value.ggml_type;
-    release_weight(&lease);
     return VG_OK;
 }
 

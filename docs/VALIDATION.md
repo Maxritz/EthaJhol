@@ -24,7 +24,7 @@ scope, so `vg_full` (the generation engine) is checked too — a per-target list
 | `vg-quant-tests` | Legacy + K-quant dequantization, **ternary and 1-bit golden vectors** | pass |
 | `vg-tokenizer-tests` | SentencePiece BPE, GPT-2 byte-level, specials, byte fallback | pass (ids match an independent Python BPE) |
 | `vg-tensor-tests` | Bounded leases, LRU eviction, mmap, async, concurrent prefetch, streaming | pass |
-| `vg-engine-tests` | Matvec parity vs reference for 18 types, probe, dense/MoE/BitNet decode, LoRA, speculative decoding, end-to-end generation | pass |
+| `vg-engine-tests` | Matvec parity vs reference for 18 types, probe, dense/MoE/BitNet decode, MoE expert-cache lifetime, LoRA, speculative decoding, end-to-end generation | pass |
 | `vg-sampler-tests` | Temperature/top-k/top-p and the additive repetition penalty | pass |
 | `vg-full-smoke` | `vg-run` on a synthetic dense model (exit status is the contract) | pass |
 | `vg-full-probe` | `vg-engine probe` reports SUPPORTED for that model | pass |
@@ -97,6 +97,32 @@ Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q4_K, Q6_K, TQ2_0, Q1_0, Q2_0, F16.
 * **Regression test added**: `vg-engine` writes a zero-expert MoE fixture and requires the
   logits to differ from the real one. Before the fix they were bit-identical.
 
+### The MoE expert cache handed out dangling pointers
+
+The expert cache stores the address of one expert's slice inside a stacked tensor, but it
+released the lease that kept that tensor alive. With mmap the slice survives anyway, so the
+bug was invisible in normal runs; on a RAM-backed source the next acquire could evict the
+tensor and free the storage every cached slot still pointed into. `VG_TIER_STORAGE` leases
+are ambiguous — an mmap pointer outlives the lease, while an unticketed storage lease is a
+private buffer that `vg_tensor_release` frees — so the lease now carries an explicit `mapped`
+flag, and `vg_tensor_release` frees on `!mapped` instead of on tier (which also fixes a leak
+of those transient storage leases). Each slot now holds either the pinned lease (ticketed
+leases keep a source-cache ref, which blocks eviction) or a private copy of just its expert
+slice (transient leases), released on eviction and on cache teardown.
+
+Evidence, in order: `vg-engine-tests` drives the MoE fixture through RAM-backed budgets of
+8, 12, 24, 32 and 64 KiB (so tensors arrive both cached and transient) with a 4-slot expert
+cache, and requires the logits to match the mmap reference exactly. Run against the previous
+code it fails under ASan with
+
+```
+ERROR: AddressSanitizer: heap-use-after-free
+SUMMARY: AddressSanitizer: heap-use-after-free src/cpu_ops.c:148 in rows_q4_0
+```
+
+and with the fix both the Release and ASan builds pass all 8 suites with no leaks. This was
+previously reported as *suspected*; it is now reproduced and fixed.
+
 ### What the engine tests actually assert
 
 * **Matvec parity**: every fused kernel is compared against `vg_cpu_matmul_ref` (single
@@ -165,7 +191,7 @@ Caveats that matter when reading this table:
 | Shader compilation (SPIR-V) | `glslangValidator` is not installed in this environment, so the 15 shaders were not recompiled here. |
 | Windows / MSVC build | No toolchain available here. |
 | Q2_K / Q3_K / Q4_K / Q5_K on real files | Only synthetic fixtures and golden vectors exercise them; no real GGUF of those types was available for download. |
-| >256 MiB tensor path (transient lease) | The real model's largest tensor is 53 MiB, so the host-budget overflow path in `tensor_source.c` is never entered. |
+| >256 MiB tensor path on a real model | The real model's largest tensor is 53 MiB, so the host-budget overflow path is exercised only by the synthetic MoE test above (which deliberately caps the budget), never by a real oversized tensor. |
 | Real BitNet 2B4T weights | A synthetic `bitnet` fixture is used; the architecture, sub-norms, per-tensor scale and ternary decode are all exercised, but not Microsoft's released file. |
 
 ## Environment

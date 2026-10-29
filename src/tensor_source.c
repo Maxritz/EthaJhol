@@ -243,7 +243,7 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
         lock_src(s); ++s->stats.lookups;
         VG_Status mst = vg_gguf_map(s->file, &mbase, &msize);
         if (mst == VG_OK && t->data_offset <= msize - vg_gguf_data_base(s->file)) {
-            ++s->stats.hits; out->tensor = t; out->data = (const unsigned char *)mbase + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0;
+            ++s->stats.hits; out->tensor = t; out->data = (const unsigned char *)mbase + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; out->mapped = 1;
             unlock_src(s); vg_trace_emit("tensor_acquire_storage", t0, vg_trace_now_ns(), t->nbytes, 0); return VG_OK;
         }
         unlock_src(s);
@@ -256,7 +256,7 @@ VG_Status vg_tensor_acquire(VG_TensorSource *s, const char *name, VG_Tier desire
     if (desired == VG_TIER_STORAGE && s->cfg.use_mmap) {
         const void *base; uint64_t size; VG_Status st = vg_gguf_map(s->file, &base, &size);
         if (st != VG_OK || t->data_offset > size - vg_gguf_data_base(s->file)) { unlock_src(s); return VG_E_IO; }
-        out->tensor = t; out->data = (const unsigned char *)base + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; unlock_src(s); return VG_OK;
+        out->tensor = t; out->data = (const unsigned char *)base + vg_gguf_data_base(s->file) + t->data_offset; out->size = (size_t)t->nbytes; out->tier = VG_TIER_STORAGE; out->source = s; out->ticket = 0; out->mapped = 1; unlock_src(s); return VG_OK;
     }
     size_t n = (size_t)t->nbytes; void *data = malloc(n ? n : 1u); if (!data) { unlock_src(s); return VG_E_NOMEM; }
     VG_Status st = vg_gguf_read(s->file, t, 0, data, n); if (st != VG_OK) { free(data); unlock_src(s); return st; }
@@ -283,7 +283,7 @@ void vg_tensor_release(VG_TensorLease *lease) {
     VG_TensorSource *s = lease->source;
     lock_src(s);
     if (lease->ticket) { for (size_t i = 0; i < s->count; ++i) if (s->entries[i].ticket == lease->ticket && s->entries[i].tensor == lease->tensor) { if (s->entries[i].refs) --s->entries[i].refs; break; } }
-    else if (lease->data && lease->tier != VG_TIER_STORAGE) free((void *)lease->data);
+    else if (lease->data && !lease->mapped) free((void *)lease->data);
     unlock_src(s); memset(lease, 0, sizeof(*lease));
 }
 VG_Status vg_tensor_prefetch(VG_TensorSource *s, const char *const *names, size_t count, VG_Tier desired) {
