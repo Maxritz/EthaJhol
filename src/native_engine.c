@@ -33,16 +33,19 @@ static int verbose(void) {
     return cached;
 }
 
-/* Repeat penalty (Keskar et al. style, as used by llama.cpp): scale already-seen logits
- * before sampling so the model does not loop on the same token. */
-static void apply_repeat_penalty(float *logits, uint32_t n_vocab, const int32_t *recent,
-                                 int32_t n_recent, float penalty) {
-    if (!logits || !recent || n_recent <= 0 || penalty <= 1.0f) return;
-    for (int32_t i = 0; i < n_recent; ++i) {
-        const int32_t t = recent[i];
+/* Repeat penalty: subtract the excess over 1.0 from every token that already appeared in
+ * the history, so the model does not loop on the same token. Additive (llama.cpp's --repeat-penalty
+ * "additive" form) because it only shifts logits that were already computed: softmax ordering of
+ * the untouched tokens is preserved exactly, and a repeated token is penalised once per
+ * occurrence. Public so the sampler tests can cover it without loading a model. */
+void vg_apply_repetition_penalty(float *logits, uint32_t n_vocab,
+                                 const int32_t *history, size_t hist_len,
+                                 float penalty) {
+    if (!logits || !history || hist_len == 0 || !(penalty > 1.0f)) return;
+    for (size_t i = 0; i < hist_len; ++i) {
+        const int32_t t = history[i];
         if (t < 0 || (uint32_t)t >= n_vocab) continue;
-        if (logits[t] > 0.0f) logits[t] /= penalty;
-        else logits[t] *= penalty;
+        logits[t] -= penalty;
     }
 }
 
@@ -253,8 +256,15 @@ VG_Status vg_generate(const char *model_path, const char *prompt,
         if (verbose()) fprintf(stderr, "[vg] prompt truncated to %zu tokens (ctx %d)\n", n_prompt_tokens, n_ctx);
     }
 
-    const int32_t bos = mcfg->bos_id;
-    const int32_t eos = mcfg->eos_id;
+    /* BOS policy belongs to the tokenizer: Qwen3 sets add_bos_token=0 and ships no bos id,
+     * so prepending one would feed -1 into the embedding lookup. A prompt that already
+     * starts with the BOS token must not get a second copy: it would shift every K/V by
+     * one position and corrupt attention over the whole context. */
+    int32_t bos = vg_tokenizer_add_bos(tok) ? vg_tokenizer_bos_id(tok) : -1;
+    if (bos < 0) bos = mcfg->bos_id;
+    if (bos < 0 || (uint32_t)bos >= mcfg->n_vocab) bos = -1;
+    int32_t eos = vg_tokenizer_eos_id(tok);
+    if (eos < 0) eos = mcfg->eos_id;
     float *logits = (float *)malloc((size_t)mcfg->n_vocab * sizeof(float));
     if (!logits) {
         free(prompt_tokens); vg_tokenizer_free(tok);
@@ -271,7 +281,9 @@ VG_Status vg_generate(const char *model_path, const char *prompt,
     int32_t kv_pos = 0;
     /* One sampling scratch buffer for the whole run: the sort workspace is reused per token. */
     VG_Cand *cand = (VG_Cand *)malloc((size_t)mcfg->n_vocab * sizeof(VG_Cand));
-    st = vg_model_graph_decode(graph, bos, kv_pos++, logits);
+    if (n_prompt_tokens > 0 && prompt_tokens && prompt_tokens[0] == bos) bos = -1;
+    st = VG_OK;
+    if (bos >= 0) st = vg_model_graph_decode(graph, bos, kv_pos++, logits);
     for (size_t i = 0; st == VG_OK && i < n_prompt_tokens && kv_pos < n_ctx; ++i)
         st = vg_model_graph_decode(graph, prompt_tokens[i], kv_pos++, logits);
 
@@ -302,7 +314,7 @@ VG_Status vg_generate(const char *model_path, const char *prompt,
     prompt_tokens = NULL;
 
     for (int32_t gen = 0; st == VG_OK && gen < n_predict && kv_pos < n_ctx; ++gen) {
-        apply_repeat_penalty(logits, mcfg->n_vocab, recent, n_recent, repeat_penalty);
+        vg_apply_repetition_penalty(logits, mcfg->n_vocab, recent, (size_t)n_recent, repeat_penalty);
         const int32_t next = sample_next_token(logits, mcfg->n_vocab, temp, top_k, top_p_val, &rng_state, cand);
         if (next == eos) break;
 

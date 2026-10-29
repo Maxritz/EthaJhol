@@ -22,6 +22,16 @@ typedef struct { uint8_t qs[64]; uint16_t d; } block_tq2_0;                  /* 
 typedef struct { uint16_t d; uint8_t qs[16]; } block_q1_0;                   /* 18 B / 128 */
 typedef struct { uint16_t d; uint8_t qs[16]; } block_q2_0;                   /* 18 B /  64 */
 
+/* Compile-time guard: struct sizes must match quant.h metadata. A silent layout drift
+ * here reinterprets every weight block, so it is checked at build time, not at runtime. */
+#define VG_SA_CAT_(a, b) a##b
+#define VG_SA_CAT(a, b) VG_SA_CAT_(a, b)
+#define VG_STATIC_ASSERT(cond) typedef char VG_SA_CAT(vg_static_assert_, __LINE__)[(cond) ? 1 : -1]
+VG_STATIC_ASSERT(sizeof(block_q4_0) == VG_QUANT_BYTES_PER_BLOCK_Q4_0);
+VG_STATIC_ASSERT(sizeof(block_q8_0) == VG_QUANT_BYTES_PER_BLOCK_Q8_0);
+VG_STATIC_ASSERT(sizeof(block_q4_K) == VG_QUANT_BYTES_PER_BLOCK_Q4_K);
+VG_STATIC_ASSERT(sizeof(block_q6_K) == VG_QUANT_BYTES_PER_BLOCK_Q6_K);
+
 /* The ternary kernels stream 1.7-2.1 bits per weight, so they are pure memory-bound
  * workloads: the only lever is keeping the load pipe full while the unpack runs. */
 #if defined(__GNUC__) || defined(__clang__)

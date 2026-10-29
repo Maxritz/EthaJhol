@@ -58,10 +58,17 @@ if(VG_ENABLE_VULKAN)
     set(SPIRV_DIR ${CMAKE_CURRENT_BINARY_DIR}/shaders)
     file(MAKE_DIRECTORY ${SPIRV_DIR})
     set(VG_SHADER_SOURCES
+      ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_i8.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_f16.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_f32.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q4_0.comp
-      ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q8_0.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q8_0.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q4_k.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/matvec_q6_k.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/activation_quant_q8.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/attn_scores.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/resid_add.comp
+${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope_adj.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rmsnorm.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/rope.comp
       ${CMAKE_CURRENT_SOURCE_DIR}/shaders/softmax.comp
@@ -72,7 +79,7 @@ if(VG_ENABLE_VULKAN)
       get_filename_component(SHADER_NAME ${SHADER} NAME)
       add_custom_command(
         OUTPUT ${SPIRV_DIR}/${SHADER_NAME}.spv
-        COMMAND ${GLSLANG_VALIDATOR} -V ${SHADER} -o ${SPIRV_DIR}/${SHADER_NAME}.spv
+        COMMAND ${GLSLANG_VALIDATOR} -V --target-env vulkan1.1 ${SHADER} -o ${SPIRV_DIR}/${SHADER_NAME}.spv
         DEPENDS ${SHADER}
         VERBATIM)
       list(APPEND VG_SHADER_OUTPUTS ${SPIRV_DIR}/${SHADER_NAME}.spv)
@@ -173,6 +180,14 @@ else()
   target_link_libraries(vg-tensor-tests PRIVATE vg_core)
 endif()
 add_test(NAME vg-tensor COMMAND vg-tensor-tests "${CMAKE_CURRENT_BINARY_DIR}/fixture_dense.gguf")
+
+# Sampling (temperature / top-k / top-p / repetition penalty) is pure logit math in the
+# engine, so it is unit-tested without loading a model.
+add_executable(vg-sampler-tests tests/test_sampler.c)
+target_include_directories(vg-sampler-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(vg-sampler-tests PRIVATE vg_full vg_core)
+add_test(NAME vg-sampler COMMAND vg-sampler-tests)
+
 add_executable(vg-engine-tests tests/test_engine.c tests/fixture.c)
 target_include_directories(vg-engine-tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CURRENT_SOURCE_DIR}/tests)
 if(TARGET vg_vulkan)

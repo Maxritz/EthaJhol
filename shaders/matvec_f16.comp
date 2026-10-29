@@ -1,49 +1,50 @@
 #version 450
-/* F16 matvec: y[row] = dot(W[row, :], x) with binary16 weights. */
 
 layout(local_size_x = 64) in;
-
 layout(std430, binding = 0) readonly buffer Weights { uint w[]; };
-layout(std430, binding = 1) readonly buffer Input   { float x[]; };
-layout(std430, binding = 2) writeonly buffer Output { float y[]; };
-layout(push_constant) uniform Params { uint in_dim; uint out_dim; } p;
+layout(std430, binding = 1) readonly buffer Scales  { uint s[]; };
+layout(std430, binding = 2) readonly buffer Input   { float x[]; };
+layout(std430, binding = 3) writeonly buffer Output { float y[]; };
+layout(push_constant) uniform Params { uint rows; uint input_dim; uint output_dim; } p;
 
-shared float partial[64];
-
-uint byte_at(uint bi) { return (w[bi >> 2] >> ((bi & 3u) * 8u)) & 0xffu; }
-uint u16_at(uint bi) { return byte_at(bi) | (byte_at(bi + 1u) << 8u); }
-
-float f16_to_f32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 0x1fu;
-    uint m = h & 0x3ffu;
-    if (e == 0u) {
-        if (m == 0u) return s != 0u ? -0.0 : 0.0;
-        e = 113u;
-        while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
-        m &= 0x3ffu;
-    } else if (e == 31u) {
-        return uintBitsToFloat((s << 31u) | 0x7f800000u | (m << 13u));
-    } else {
-        e += 112u;
+float decode_f16(uint h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mantissa = h & 0x3ffu;
+    uint f;
+    if (exp == 0u) {
+        if (mantissa == 0u) { f = sign << 31u; }
+        else {
+            int e = -1;
+            uint m = mantissa;
+            do { m <<= 1u; ++e; } while ((m & 0x400u) == 0u);
+            m &= 0x3ffu;
+            f = (sign << 31u) | (uint(127 - 15 - e) << 23u) | (m << 13u);
+        }
     }
-    return uintBitsToFloat((s << 31u) | (e << 23u) | (m << 13u));
+    else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
+    else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
+    return uintBitsToFloat(f);
+}
+
+uint load_u16(uint index) {
+    uint word = w[index >> 1u];
+    return (index & 1u) == 0u ? (word & 0xffffu) : (word >> 16u);
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= p.out_dim) return;
-    uint lane = gl_LocalInvocationID.x;
-    uint row_byte = row * p.in_dim * 2u;
+    uint linear = gl_GlobalInvocationID.x;
+    uint total = p.rows * p.output_dim;
+    if (linear >= total) return;
+    uint row = linear / p.output_dim;
+    uint o = linear - row * p.output_dim;
     float acc = 0.0;
-    for (uint k = lane; k < p.in_dim; k += 64u) {
-        acc += f16_to_f32(u16_at(row_byte + k * 2u)) * x[k];
+    uint base = o * p.input_dim;
+    uint xbase = row * p.input_dim;
+    for (uint k = 0u; k < p.input_dim; ++k) {
+        acc += decode_f16(load_u16(base + k)) * x[xbase + k];
     }
-    partial[lane] = acc;
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lane < s) partial[lane] += partial[lane + s];
-        barrier();
-    }
-    if (lane == 0u) y[row] = partial[0];
+    uint scale_val = s[o >> 1u];
+    float sc = decode_f16((o & 1u) == 0u ? (scale_val & 0xffffu) : (scale_val >> 16u));
+    y[linear] = acc * sc;
 }

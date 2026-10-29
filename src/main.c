@@ -23,6 +23,11 @@
 
 static const char *status_name(VG_Status s) { switch (s) { case VG_OK: return "ok"; case VG_E_INVALID: return "invalid"; case VG_E_IO: return "io"; case VG_E_FORMAT: return "format"; case VG_E_RANGE: return "range"; case VG_E_NOMEM: return "nomem"; case VG_E_UNSUPPORTED: return "unsupported"; default: return "error"; } }
 
+/* Only the inference paths below call this; a build with neither the Vulkan nor the full
+ * engine still compiles this file, so it is explicitly allowed to be unused. */
+static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, int32_t top_k,
+                            float top_p, float repeat_penalty, const int32_t *hist, int32_t hist_len,
+                            uint32_t *rng) __attribute__((unused));
 static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, int32_t top_k,
                             float top_p, float repeat_penalty, const int32_t *hist, int32_t hist_len,
                             uint32_t *rng) {
@@ -30,6 +35,9 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
         int32_t best = 0; for (uint32_t i = 1; i < n_vocab; ++i) if (logits[i] > logits[best]) best = (int32_t)i;
         return best;
     }
+#ifdef VG_BUILD_FULL_ENGINE
+    vg_apply_repetition_penalty(logits, n_vocab, hist, (size_t)hist_len, repeat_penalty);
+#else
     if (repeat_penalty != 1.0f && hist) {
         for (int32_t i = 0; i < hist_len; ++i) {
             int32_t t = hist[i];
@@ -37,6 +45,7 @@ static int32_t sample_token(float *logits, uint32_t n_vocab, float temperature, 
             else if (t >= 0 && (uint32_t)t < n_vocab && logits[t] < 0.0f) logits[t] *= repeat_penalty;
         }
     }
+#endif
     for (uint32_t i = 0; i < n_vocab; ++i) logits[i] /= temperature;
     /* Softmax */
     float mx = logits[0]; for (uint32_t i = 1; i < n_vocab; ++i) if (logits[i] > mx) mx = logits[i];
@@ -103,14 +112,21 @@ static const char *shader_dir(void) { FILE *f = fopen("shaders/matvec_q4_0.comp.
 static int vk_self_test(void) {
     VG_VK *v = NULL; VG_VKConfig cfg; memset(&cfg, 0, sizeof(cfg)); cfg.device_index = UINT32_MAX; cfg.shader_dir = shader_dir();
     VG_Status st = vg_vk_open(&cfg, &v); if (st != VG_OK) { fprintf(stderr, "Vulkan unavailable: %s\n", status_name(st)); return 2; }
-    /* Two Q4_0 rows, in_dim=32: d=1.0 and every nibble = 9 -> each weight is +1. */
-    unsigned char w[2 * 18]; memset(w, 0x99, sizeof(w));
-    w[0] = 0x00; w[1] = 0x3c; w[18] = 0x00; w[19] = 0x3c;
-    float x[32]; for (int i = 0; i < 32; ++i) x[i] = 1.0f;
+    /* int8 matvec: one row of 4 weights against a constant input. Row 0 = 1+2+3+4 = 10 at
+     * scale 1.0, row 1 = -1-2-3-4 = -10 at scale 0.5 -> -5. Weights and scales live in device
+     * buffers, so this exercises upload + descriptor binding + dispatch, not just the shader. */
+    const int8_t w[8] = {1, 2, 3, 4, -1, -2, -3, -4};
+    const float scales[2] = {1.0f, 0.5f};
+    const float x[4] = {1.0f, 1.0f, 1.0f, 1.0f};
     float y[2] = {0.0f, 0.0f};
-    st = vg_vk_matvec_q4_0(v, w, x, y, 2, 32);
+    VG_VKBuffer *wb = NULL, *sb = NULL;
+    st = vg_vk_buffer_upload(v, w, sizeof(w), &wb);
+    if (st == VG_OK) st = vg_vk_buffer_upload(v, scales, sizeof(scales), &sb);
+    if (st == VG_OK) st = vg_vk_matvec_i8(v, wb, sb, x, y, 1, 4, 2);
     printf("vulkan self-test: status=%s y=[%.3f, %.3f]\n", status_name(st), y[0], y[1]);
-    int ok = st == VG_OK && fabsf(y[0] - 32.0f) < 0.1f && fabsf(y[1] - 32.0f) < 0.1f;
+    int ok = st == VG_OK && fabsf(y[0] - 10.0f) < 0.01f && fabsf(y[1] + 5.0f) < 0.01f;
+    vg_vk_buffer_release(v, wb);
+    vg_vk_buffer_release(v, sb);
     vg_vk_close(v);
     return ok ? 0 : 2;
 }
@@ -472,6 +488,7 @@ static int diagnostics(const char *path) {
     }
     vg_gguf_close(g); return 0;
 }
+static int emit_stdout(const char *piece, size_t bytes, int32_t token, void *user) __attribute__((unused));
 static int emit_stdout(const char *piece, size_t bytes, int32_t token, void *user) { (void)token; (void)user; fwrite(piece, 1, bytes, stdout); fflush(stdout); return 1; }
 #ifdef VG_BUILD_FULL_ENGINE
 static int chat_mode(const char *path, const char *system_prompt) {
@@ -505,8 +522,11 @@ int main(int argc, char **argv) {
 #ifdef VG_HAS_VULKAN
     if (argc == 2 && strcmp(argv[1], "--vulkan-info") == 0) return vk_info();
     if (argc == 2 && strcmp(argv[1], "--vulkan-self-test") == 0) return vk_self_test();
+#ifdef VG_BUILD_FULL_ENGINE
+    /* vk_infer drives the generation engine, so it only exists when that is built. */
     if (argc == 3 && strcmp(argv[1], "--vulkan-infer") == 0) return vk_infer(argv[2], NULL);
     if (argc == 4 && strcmp(argv[1], "--vulkan-infer") == 0) return vk_infer(argv[2], argv[3]);
+#endif
 #else
     /* Built against the no-Vulkan stub: say why instead of printing the generic usage line. */
     if (argc == 2 && (strcmp(argv[1], "--vulkan-info") == 0 || strcmp(argv[1], "--vulkan-self-test") == 0)) {

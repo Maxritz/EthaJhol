@@ -14,7 +14,7 @@ quantized matrix-vector work when a device and an SDK are available.
 | BitNet b1.58 / ternary models (`bitnet` arch, `attn_sub_norm` + `ffn_sub_norm`, per-tensor `.scale`) | Yes — TQ2_0/TQ1_0/Q2_0/Q1_0 kernels, probe-validated |
 | MoE models (mixtral / qwen-moe blocks: router + stacked experts) | Yes — top-k routing with routing weights and an LRU expert cache |
 | CPU inference | Yes, row-parallel across all cores (`--threads N`, default = hardware) |
-| Vulkan inference | Q4_0, Q8_0, F16, F32 matvec — see [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md) |
+| Vulkan inference | Q4_0, Q8_0 (dp4a), Q4_K, Q6_K, I8, F16, F32 matvec plus fused dense/MoE layer paths — see [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md) |
 | Large models | mmap + lazy paging; tensors are never copied whole |
 | Quantized weights | F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K, **TQ1_0, TQ2_0, Q1_0, Q2_0** — see [docs/QUANTIZATION.md](docs/QUANTIZATION.md) |
 | Unsupported quants (IQ1/IQ2/IQ3/IQ4_XS/MXFP4/...) | Rejected up front by the probe, naming the tensor |
@@ -89,14 +89,16 @@ result: NOT SUPPORTED: tensor 'blk.0.attn_q.weight' uses IQ2_XXS, which has no C
 
 ## Tests
 
-`ctest` runs six suites. The engine suite generates its own deterministic GGUF fixtures at
+`ctest` runs eight suites. The engine suite generates its own deterministic GGUF fixtures at
 runtime (dense, MoE, and an intentionally unsupported one), so the runner needs no external
 model download:
 
 | Test | Covers |
 | --- | --- |
 | `vg-core` | paged KV allocation, sequence fork, radix prefix lookup |
-| `vg-quant` | legacy packed-block dequantization, Q4_K/Q6_K block math |
+| `vg-quant` | legacy packed-block dequantization, Q4_K/Q6_K block math, fused-vs-reference matmul round-trips, ternary golden vectors |
+| `vg-tokenizer` | SentencePiece + GPT-2 byte-level BPE, special/control tokens, decode round-trip |
+| `vg-sampler` | temperature/top-k/top-p and the additive repetition penalty |
 | `vg-tensor` | tensor ranges, read bounds, leases, budget eviction, mmap address stability, chunked streaming, async prefetch incl. error reporting, graph load + MoE router |
 | `vg-engine` | half→float conversion, every supported quant type, fused-vs-reference matmul parity, threaded determinism, thread-count resizing, thread-pool completion, probe (accept + exact rejection), dense decode determinism, MoE routing and expert-cache behaviour, in-process `vg_generate()` determinism and probe-gated rejection |
 | `vg-full-smoke` | end-to-end `vg-run` generation on a synthetic model, asserting it prints tokens |
@@ -117,16 +119,18 @@ Measured with `vg-mmbench` on the 2-core x86-64 container used for this change (
 | **TQ2_0** | **4.12 MiB** | **3.40** | 1.19 GiB/s |
 | Q4_0 | 9.00 MiB | 5.54 | 1.59 GiB/s |
 | Q2_0 | 4.50 MiB | 5.39 | 0.81 GiB/s |
-| Q1_0 | 2.25 MiB | 6.26 | 0.35 GiB/s |
-| Q8_0 | 17.00 MiB | 6.51 | 2.55 GiB/s |
-| Q4_K | 9.00 MiB | 6.99 | 1.26 GiB/s |
-| TQ1_0 | 3.38 MiB | 7.83 | 0.42 GiB/s |
-| Q6_K | 13.12 MiB | 10.68 | 1.20 GiB/s |
+| Q1_0 | 2.25 MiB | 5.80 | 0.38 GiB/s |
+| Q8_0 | 17.00 MiB | 6.49 | 2.56 GiB/s |
+| Q4_K | 9.00 MiB | 7.07 | 1.24 GiB/s |
+| TQ1_0 | 3.38 MiB | 7.77 | 0.42 GiB/s |
+| Q6_K | 13.12 MiB | 10.66 | 1.20 GiB/s |
+| F32 | 64.00 MiB | 8.74 | 7.15 GiB/s |
+| F16 | 32.00 MiB | 17.38 | 1.80 GiB/s |
 
 `vg-mmbench` reports the **minimum** of N iterations: this box is a shared 2-vCPU VM where the
 same Q4_0 workload varied between 5.8 and 8.2 ms/op across identical runs, enough to hide a real
-15% kernel change. Threading is a genuine 1.9× on this workload (Q4_0: 5.54 ms at 2 threads vs
-11.2 ms at 1).
+15% kernel change. Threading is a genuine 1.84× on this workload (Q4_0: 5.54 ms at 2 threads vs
+10.20 ms at 1, Q6_K: 10.66 vs 19.61 ms).
 
 Kernel work in this revision: TQ2_0 went 7.86 → 3.40 ms/op (2.3×) by loading each packed byte
 once and running four accumulator chains from it instead of re-reading the byte per bit-plane;
@@ -168,5 +172,5 @@ MIT for the engine files; see `LICENSE` and [THIRD_PARTY_NOTICES.md](THIRD_PARTY
 | --- | --- |
 | [docs/VALIDATION.md](docs/VALIDATION.md) | Measured test/build results, and an explicit list of what could not be verified here |
 | [docs/QUANTIZATION.md](docs/QUANTIZATION.md) | Every quant type, ternary decode order, kernel strategy |
-| [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md) | Which ops the Vulkan backend executes, resident-weight design, device status |
+| [docs/GPU_SUPPORT.md](docs/GPU_SUPPORT.md) | Which ops the Vulkan backend executes, residency/dispatch model, device status |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Layer boundaries and storage contracts |

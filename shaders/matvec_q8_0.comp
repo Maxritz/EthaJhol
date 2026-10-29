@@ -1,60 +1,67 @@
 #version 450
-/* Q8_0 matvec. Block layout (34 bytes): fp16 d, then 32 signed int8 values. */
+#extension GL_EXT_integer_dot_product : require
 
-layout(local_size_x = 64) in;
+/* Q8_0 matvec, dp4a. Each workgroup (256 lanes = 8 sub-groups of 32) computes 8
+ * output rows: sub-group g does row = wg*8 + g with a 32-lane strided scan of the
+ * 32-value weight blocks, then a shared-memory tree reduction inside the
+ * sub-group. Processing 8 rows per workgroup amortizes the reduction barriers
+ * over 8 rows (a single-row-per-workgroup kernel is dispatch-bound on the
+ * 128K-row lm_head). */
 
-layout(std430, binding = 0) readonly buffer Weights { uint w[]; };
-layout(std430, binding = 1) readonly buffer Input   { float x[]; };
-layout(std430, binding = 2) writeonly buffer Output { float y[]; };
-layout(push_constant) uniform Params { uint in_dim; uint out_dim; } p;
+layout(local_size_x = 256) in;
+layout(std430, binding = 0) readonly buffer WQ { uint wq[]; };   /* repacked int8 qs: 8 aligned u32 per block */
+layout(std430, binding = 1) readonly buffer WS { uint ws[]; };   /* fp16 scales, 2 per u32 */
+layout(std430, binding = 2) readonly buffer XD { float xd[]; };  /* activation scale per block */
+layout(std430, binding = 3) readonly buffer XQ { uint xq[]; };   /* quantized activations: 8 u32 per block */
+layout(std430, binding = 4) writeonly buffer Y { float y[]; };
+layout(push_constant) uniform Params { uint out_dim; uint in_dim; } p;
 
-shared float partial[64];
+shared float red[8][32];
 
-uint byte_at(uint bi) { return (w[bi >> 2] >> ((bi & 3u) * 8u)) & 0xffu; }
-uint u16_at(uint bi) { return byte_at(bi) | (byte_at(bi + 1u) << 8u); }
-
-float f16_to_f32(uint h) {
-    uint s = (h >> 15u) & 1u;
-    uint e = (h >> 10u) & 0x1fu;
-    uint m = h & 0x3ffu;
-    if (e == 0u) {
-        if (m == 0u) return s != 0u ? -0.0 : 0.0;
-        e = 113u;
-        while ((m & 0x400u) == 0u) { m <<= 1u; e -= 1u; }
-        m &= 0x3ffu;
-    } else if (e == 31u) {
-        return uintBitsToFloat((s << 31u) | 0x7f800000u | (m << 13u));
-    } else {
-        e += 112u;
-    }
-    return uintBitsToFloat((s << 31u) | (e << 23u) | (m << 13u));
+float decode_f16(uint h) {
+    uint sign = (h >> 15u) & 1u;
+    uint exp = (h >> 10u) & 0x1fu;
+    uint mantissa = h & 0x3ffu;
+    uint f;
+    if (exp == 0u) {
+        if (mantissa == 0u) { f = sign << 31u; }
+        else {
+            int e = -1;
+            uint m = mantissa;
+            do { m <<= 1u; ++e; } while ((m & 0x400u) == 0u);
+            m &= 0x3ffu;
+            f = (sign << 31u) | (uint(127 - 15 - e) << 23u) | (m << 13u);
+        }
+    } else if (exp == 31u) { f = (sign << 31u) | 0x7f800000u | (mantissa << 13u); }
+    else { f = (sign << 31u) | ((exp + 127u - 15u) << 23u) | (mantissa << 13u); }
+    return uintBitsToFloat(f);
 }
 
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= p.out_dim) return;
-    uint lane = gl_LocalInvocationID.x;
-    uint blocks = p.in_dim / 32u;
-    uint row_byte = row * blocks * 34u;
+    uint lid  = gl_LocalInvocationID.x;
+    uint grp  = lid >> 5u;
+    uint lane = lid & 31u;
+    uint row  = gl_WorkGroupID.x * 8u + grp;
+    uint bpr  = p.in_dim / 32u;
+
     float acc = 0.0;
-
-    for (uint b = lane; b < blocks; b += 64u) {
-        uint byte = row_byte + b * 34u;
-        float d = f16_to_f32(u16_at(byte));
-        float sum = 0.0;
-        for (uint j = 0u; j < 32u; ++j) {
-            int q = int(byte_at(byte + 2u + j));
-            if (q > 127) q -= 256;   /* int8 */
-            sum += float(q) * x[b * 32u + j];
+    if (row < p.out_dim) {
+        for (uint gb = lane; gb < bpr; gb += 32u) {
+            uint blk = row * bpr + gb;
+            int a = 0;
+            for (uint w = 0u; w < 8u; ++w) {
+                a += dotPacked4x8EXT(int(wq[blk * 8u + w]), int(xq[gb * 8u + w]));
+            }
+            uint sw = ws[blk >> 1u];
+            uint su = (blk & 1u) == 0u ? (sw & 0xffffu) : (sw >> 16u);
+            acc += float(a) * decode_f16(su) * xd[gb];
         }
-        acc += d * sum;
     }
-
-    partial[lane] = acc;
+    red[grp][lane] = acc;
     barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (lane < s) partial[lane] += partial[lane + s];
+    for (uint s = 16u; s > 0u; s >>= 1u) {
+        if (lane < s) red[grp][lane] += red[grp][lane + s];
         barrier();
     }
-    if (lane == 0u) y[row] = partial[0];
+    if (lane == 0u && row < p.out_dim) y[row] = red[grp][0];
 }
